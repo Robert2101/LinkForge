@@ -1,0 +1,18 @@
+{
+  "name": "linkforge-backend",
+  "version": "0.1.0",
+  "description": "LinkForge backend — URL shortener API",
+  "main": "src/server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node src/server.js",
+    "dev": "node --watch --env-file=.env src/server.js"
+  },
+  "keywords": [],
+  "author": "Robert",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
