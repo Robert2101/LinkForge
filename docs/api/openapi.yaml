@@ -1,0 +1,384 @@
+openapi: 3.0.3
+info:
+  title: LinkForge API
+  description: Production-grade, high-throughput URL shortening and analytics platform.
+  version: 1.0.0
+servers:
+  - url: http://localhost:5001
+    description: Local development server
+
+paths:
+  /health:
+    get:
+      summary: Deep Health Check
+      description: Returns connectivity status and round-trip latency to PostgreSQL and Redis.
+      responses:
+        '200':
+          description: System healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: System degraded
+
+  /:code:
+    get:
+      summary: Redirect to Destination URL
+      description: Resolves short-code via Redis cache or PostgreSQL, logs click analytics asynchronously, and redirects client.
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+          example: aB7xK9p
+      responses:
+        '302':
+          description: Found. Redirects to original URL in Location header.
+        '403':
+          description: Link deactivated by owner
+        '404':
+          description: Short code not found
+        '410':
+          description: Link expired
+
+  /api/v1/auth/register:
+    post:
+      summary: Register New User
+      description: Hashes password with Argon2id and issues initial JWT access token and refresh token family.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: User registered successfully
+        '409':
+          description: Email already in use
+        '422':
+          description: Validation error
+
+  /api/v1/auth/login:
+    post:
+      summary: User Login
+      description: Verifies credentials, spawns a new refresh token family, sets secure HTTP-only cookie.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authentication successful
+        '401':
+          description: Invalid email or password
+
+  /api/v1/auth/refresh:
+    post:
+      summary: Refresh Access Token (Token Rotation)
+      description: Exchanges a single-use refresh token for a new token pair. If a revoked token is presented, detects token theft and invalidates the entire family.
+      responses:
+        '200':
+          description: New access token issued
+        '401':
+          description: Invalid token or reuse detected
+
+  /api/v1/auth/logout:
+    post:
+      summary: User Logout
+      description: Revokes active refresh token and clears cookie.
+      responses:
+        '200':
+          description: Logged out successfully
+
+  /api/v1/auth/me:
+    get:
+      summary: Get Authenticated User Profile
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: User profile details
+        '401':
+          description: Unauthorized
+
+  /api/v1/urls:
+    post:
+      summary: Create Short URL
+      description: Generates a cryptographically random Base62 short-code or validates a custom alias. Supports guest or authenticated requests.
+      security:
+        - BearerAuth: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUrlRequest'
+      responses:
+        '201':
+          description: Short URL created successfully
+        '409':
+          description: Custom alias conflict
+        '429':
+          description: Rate limit exceeded
+
+    get:
+      summary: List User URLs
+      description: Returns paginated list of URLs owned by authenticated user.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: search
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Paginated URL list
+
+  /api/v1/urls/{id}:
+    get:
+      summary: Get URL by ID
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: URL details
+        '404':
+          description: Not found
+
+    patch:
+      summary: Update URL
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUrlRequest'
+      responses:
+        '200':
+          description: URL updated and cache invalidated
+        '403':
+          description: Forbidden
+
+    delete:
+      summary: Delete URL
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: URL deleted and cache invalidated
+
+  /api/v1/urls/{id}/qr:
+    get:
+      summary: Generate QR Code
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [png, svg]
+            default: png
+      responses:
+        '200':
+          description: QR code generated
+
+  /api/v1/analytics/{urlId}/summary:
+    get:
+      summary: URL Click Summary Metrics
+      description: Returns total clicks, clicks past 24h, 7d, 30d, and unique visitors.
+      parameters:
+        - name: urlId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: URL metrics summary
+
+  /api/v1/analytics/{urlId}/timeseries:
+    get:
+      summary: Click Timeseries
+      parameters:
+        - name: urlId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: days
+          in: query
+          schema:
+            type: integer
+            default: 14
+      responses:
+        '200':
+          description: Daily click timeseries
+
+  /api/v1/analytics/{urlId}/breakdown:
+    get:
+      summary: Categorical Click Breakdown
+      description: Returns click counts grouped by device, browser, operating system, and referrer.
+      parameters:
+        - name: urlId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Categorical breakdown
+
+  /api/v1/analytics/overview:
+    get:
+      summary: User Dashboard Overview
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Aggregated metrics across user URLs
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        timestamp:
+          type: string
+          format: date-time
+        uptimeSeconds:
+          type: integer
+        database:
+          type: object
+          properties:
+            status:
+              type: string
+              example: connected
+            latencyMs:
+              type: number
+              example: 45
+        redis:
+          type: object
+          properties:
+            status:
+              type: string
+              example: fallback_mode
+
+    RegisterRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          example: dev@linkforge.io
+        password:
+          type: string
+          format: password
+          example: StrongPass123!
+        name:
+          type: string
+          example: Alex Developer
+
+    LoginRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+
+    CreateUrlRequest:
+      type: object
+      required:
+        - originalUrl
+      properties:
+        originalUrl:
+          type: string
+          format: uri
+          example: https://github.com/torvalds/linux
+        customAlias:
+          type: string
+          minLength: 3
+          maxLength: 30
+          example: linux-repo
+        expiresAt:
+          type: string
+          format: date-time
+          example: 2026-12-31T23:59:59.000Z
+
+    UpdateUrlRequest:
+      type: object
+      properties:
+        originalUrl:
+          type: string
+          format: uri
+        isActive:
+          type: boolean
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
