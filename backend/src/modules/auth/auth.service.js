@@ -169,7 +169,7 @@ export const authService = {
     );
 
     const refreshToken = jwt.sign(
-      { sub: userId, familyId },
+      { sub: userId, familyId, jti: crypto.randomUUID() },
       env.JWT_REFRESH_SECRET,
       { expiresIn: env.JWT_REFRESH_EXPIRES_IN }
     );
