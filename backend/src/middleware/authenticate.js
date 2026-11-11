@@ -1,47 +1,34 @@
 import jwt from "jsonwebtoken";
 import { env } from "../config/env.js";
-import { UnauthorizedError } from "../lib/errors.js";
+import { unauthorized } from "../lib/errors.js";
 
-/**
- * Enforces valid Bearer JWT access token on protected routes.
- */
-export function authenticate(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return next(new UnauthorizedError("Authentication token is missing or malformed"));
-  }
+// Reads "Authorization: Bearer <access token>" and returns the signed-in
+// user, or null when no token was sent. A token that is present but invalid
+// or expired is always an error, so the browser knows to refresh it.
+function readUser(req) {
+  const header = req.headers.authorization;
+  if (!header) return null;
 
-  const token = authHeader.split(" ")[1];
+  const [scheme, token] = header.split(" ");
+  if (scheme !== "Bearer" || !token) throw unauthorized("Malformed Authorization header");
 
   try {
-    const payload = jwt.verify(token, env.JWT_ACCESS_SECRET);
-    req.user = { id: payload.sub };
-    next();
-  } catch (err) {
-    if (err.name === "TokenExpiredError") {
-      return next(new UnauthorizedError("Access token expired", { expired: true }));
-    }
-    return next(new UnauthorizedError("Invalid access token"));
+    const payload = jwt.verify(token, env.JWT_ACCESS_SECRET, { algorithms: ["HS256"] });
+    return { id: payload.sub };
+  } catch {
+    throw unauthorized("Session expired. Sign in again.");
   }
 }
 
-/**
- * Optional authentication: attaches user if token is valid, allows guest if missing.
- */
-export function optionalAuthenticate(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    req.user = null;
-    return next();
-  }
+// The route only works for signed-in users.
+export function requireAuth(req, res, next) {
+  req.user = readUser(req);
+  if (!req.user) throw unauthorized();
+  next();
+}
 
-  const token = authHeader.split(" ")[1];
-
-  try {
-    const payload = jwt.verify(token, env.JWT_ACCESS_SECRET);
-    req.user = { id: payload.sub };
-  } catch (err) {
-    req.user = null;
-  }
+// The route works for everyone; req.user is set when the caller is signed in.
+export function optionalAuth(req, res, next) {
+  req.user = readUser(req);
   next();
 }

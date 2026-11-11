@@ -1,19 +1,18 @@
 import pino from "pino";
 import { env } from "../config/env.js";
 
-const isDev = env.NODE_ENV === "development";
+const defaultLevel = {
+  development: "debug",
+  test: "silent",
+  production: "info",
+}[env.NODE_ENV];
 
+// JSON logs in production (for log collectors), readable logs in development.
 export const logger = pino({
-  level: env.NODE_ENV === "test" ? "silent" : isDev ? "debug" : "info",
-  redact: ["req.headers.authorization", "req.headers.cookie", "password", "passwordHash"],
-  transport: isDev
-    ? {
-        target: "pino-pretty",
-        options: {
-          colorize: true,
-          translateTime: "SYS:standard",
-          ignore: "pid,hostname",
-        },
-      }
-    : undefined,
+  level: env.LOG_LEVEL ?? defaultLevel,
+  redact: ["req.headers.authorization", "req.headers.cookie"],
+  transport:
+    env.NODE_ENV === "development"
+      ? { target: "pino-pretty", options: { translateTime: "HH:MM:ss", ignore: "pid,hostname" } }
+      : undefined,
 });

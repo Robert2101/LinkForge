@@ -1,32 +1,34 @@
-import { ValidationError } from "../lib/errors.js";
+import { validationFailed } from "../lib/errors.js";
 
-/**
- * Middleware factory to validate request against Zod schemas.
- * @param {Object} schemas - Optional { body, query, params } Zod schemas
- */
-export function validate(schemas = {}) {
-  return async (req, res, next) => {
-    try {
-      if (schemas.body) {
-        req.body = await schemas.body.parseAsync(req.body);
+// Checks the request against Zod schemas before the route handler runs.
+//
+//   router.post("/", validate({ body: createLinkBody }), handler)
+//
+// The cleaned, typed values are placed on req.valid (req.valid.body,
+// req.valid.query, req.valid.params). Handlers read from there, so they
+// never touch unvalidated input.
+export function validate(schemas) {
+  return function validateRequest(req, res, next) {
+    const valid = {};
+    const problems = [];
+
+    for (const part of ["params", "query", "body"]) {
+      const schema = schemas[part];
+      if (!schema) continue;
+
+      const result = schema.safeParse(req[part] ?? {});
+      if (result.success) {
+        valid[part] = result.data;
+        continue;
       }
-      if (schemas.query) {
-        req.query = await schemas.query.parseAsync(req.query);
+      for (const issue of result.error.issues) {
+        problems.push({ field: issue.path.join(".") || part, message: issue.message });
       }
-      if (schemas.params) {
-        req.params = await schemas.params.parseAsync(req.params);
-      }
-      next();
-    } catch (error) {
-      if (error.issues) {
-        const formatted = error.issues.map((issue) => ({
-          field: issue.path.join("."),
-          message: issue.message,
-          code: issue.code,
-        }));
-        return next(new ValidationError("Request validation failed", formatted));
-      }
-      next(error);
     }
+
+    if (problems.length > 0) return next(validationFailed(problems));
+
+    req.valid = valid;
+    next();
   };
 }
