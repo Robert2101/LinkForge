@@ -1,42 +1,31 @@
 import {
   pgTable,
   uuid,
+  bigint,
   varchar,
   text,
   integer,
   boolean,
   timestamp,
   index,
-  uniqueIndex,
 } from "drizzle-orm/pg-core";
-import { relations } from "drizzle-orm";
+import { sql } from "drizzle-orm";
 
-// ---------------------------------------------------------------------------
-// 1. Users Table
-// ---------------------------------------------------------------------------
-export const users = pgTable(
-  "users",
-  {
-    id: uuid("id").defaultRandom().primaryKey(),
-    email: varchar("email", { length: 255 }).notNull().unique(),
-    passwordHash: text("password_hash").notNull(),
-    name: varchar("name", { length: 120 }),
-    role: varchar("role", { length: 20 }).default("user").notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true })
-      .defaultNow()
-      .notNull(),
-    updatedAt: timestamp("updated_at", { withTimezone: true })
-      .defaultNow()
-      .notNull(),
-  },
-  (table) => [
-    uniqueIndex("users_email_idx").on(table.email),
-  ]
-);
+// Table definitions used by the query builder.
+// The tables themselves are created by the SQL files in backend/migrations.
+// Each index below exists for one specific query; the reason is written next to it.
 
-// ---------------------------------------------------------------------------
-// 2. Refresh Tokens Table (Token Rotation & Family Reuse Detection)
-// ---------------------------------------------------------------------------
+const createdAt = () => timestamp("created_at", { withTimezone: true }).defaultNow().notNull();
+
+export const users = pgTable("users", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  // UNIQUE creates the index used by login (lookup by email).
+  email: varchar("email", { length: 255 }).notNull().unique(),
+  passwordHash: text("password_hash").notNull(),
+  name: varchar("name", { length: 120 }),
+  createdAt: createdAt(),
+});
+
 export const refreshTokens = pgTable(
   "refresh_tokens",
   {
@@ -44,101 +33,74 @@ export const refreshTokens = pgTable(
     userId: uuid("user_id")
       .references(() => users.id, { onDelete: "cascade" })
       .notNull(),
-    tokenHash: varchar("token_hash", { length: 255 }).notNull().unique(),
+    // Only a SHA-256 hash of the token is stored. UNIQUE gives the lookup index.
+    tokenHash: varchar("token_hash", { length: 64 }).notNull().unique(),
+    // All tokens descended from one login share a family, so a stolen token
+    // can be answered by revoking the whole family.
     familyId: uuid("family_id").notNull(),
-    isRevoked: boolean("is_revoked").default(false).notNull(),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true })
-      .defaultNow()
-      .notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: createdAt(),
   },
   (table) => [
-    uniqueIndex("refresh_tokens_hash_idx").on(table.tokenHash),
-    index("refresh_tokens_family_idx").on(table.userId, table.familyId),
+    // "Revoke every token in this family" filters by family_id alone.
+    index("refresh_tokens_family_id_idx").on(table.familyId),
+    // Foreign key index: deleting a user cascades here, and expired-session
+    // cleanup filters by user_id.
+    index("refresh_tokens_user_id_idx").on(table.userId),
   ]
 );
 
-// ---------------------------------------------------------------------------
-// 3. URLs Table
-// ---------------------------------------------------------------------------
 export const urls = pgTable(
   "urls",
   {
     id: uuid("id").defaultRandom().primaryKey(),
+    // Null for links created without an account.
     userId: uuid("user_id").references(() => users.id, { onDelete: "set null" }),
     originalUrl: text("original_url").notNull(),
+    // The part after the slash. Either a generated code or a custom alias.
+    // UNIQUE creates the index behind every redirect: one B-tree lookup.
     shortCode: varchar("short_code", { length: 32 }).notNull().unique(),
-    customAlias: varchar("custom_alias", { length: 64 }).unique(),
+    isCustom: boolean("is_custom").default(false).notNull(),
+    // Kept on the row so listing links never has to count the clicks table.
     clickCount: integer("click_count").default(0).notNull(),
     isActive: boolean("is_active").default(true).notNull(),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
-    createdAt: timestamp("created_at", { withTimezone: true })
-      .defaultNow()
-      .notNull(),
-    updatedAt: timestamp("updated_at", { withTimezone: true })
-      .defaultNow()
-      .notNull(),
+    createdAt: createdAt(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
-    uniqueIndex("urls_short_code_idx").on(table.shortCode),
-    uniqueIndex("urls_custom_alias_idx").on(table.customAlias),
-    index("urls_user_id_idx").on(table.userId),
+    // Dashboard list: WHERE user_id = ? ORDER BY created_at DESC LIMIT n.
+    // Equality column first, sort column second, so Postgres reads the rows
+    // already in order and stops after one page. Partial: anonymous links
+    // (user_id IS NULL) are never listed, so they are left out of the index.
+    index("urls_user_id_created_at_idx")
+      .on(table.userId, table.createdAt.desc())
+      .where(sql`${table.userId} is not null`),
   ]
 );
 
-// ---------------------------------------------------------------------------
-// 4. Click Analytics Table
-// ---------------------------------------------------------------------------
 export const clicks = pgTable(
   "clicks",
   {
-    id: uuid("id").defaultRandom().primaryKey(),
+    // Clicks are append-only and high volume. A sequential bigint key keeps
+    // inserts at the right-hand edge of the index (random UUIDs scatter them).
+    id: bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity(),
     urlId: uuid("url_id")
       .references(() => urls.id, { onDelete: "cascade" })
       .notNull(),
-    timestamp: timestamp("timestamp", { withTimezone: true })
-      .defaultNow()
-      .notNull(),
-    ipHash: varchar("ip_hash", { length: 64 }),
-    userAgent: text("user_agent"),
+    clickedAt: timestamp("clicked_at", { withTimezone: true }).defaultNow().notNull(),
+    // Salted hash of the visitor IP, used only to count unique visitors.
+    ipHash: varchar("ip_hash", { length: 32 }),
     browser: varchar("browser", { length: 64 }),
     os: varchar("os", { length: 64 }),
-    device: varchar("device", { length: 64 }),
-    referrer: text("referrer"),
-    country: varchar("country", { length: 64 }),
+    device: varchar("device", { length: 16 }),
+    referrer: varchar("referrer", { length: 255 }),
+    country: varchar("country", { length: 2 }),
   },
   (table) => [
-    index("clicks_url_id_idx").on(table.urlId),
-    index("clicks_url_timestamp_idx").on(table.urlId, table.timestamp),
+    // Every analytics query is "clicks of one link inside a time range".
+    // This index answers that directly, and also covers the foreign key.
+    index("clicks_url_id_clicked_at_idx").on(table.urlId, table.clickedAt),
   ]
 );
-
-// ---------------------------------------------------------------------------
-// Relations Definition
-// ---------------------------------------------------------------------------
-export const usersRelations = relations(users, ({ many }) => ({
-  urls: many(urls),
-  refreshTokens: many(refreshTokens),
-}));
-
-export const refreshTokensRelations = relations(refreshTokens, ({ one }) => ({
-  user: one(users, {
-    fields: [refreshTokens.userId],
-    references: [users.id],
-  }),
-}));
-
-export const urlsRelations = relations(urls, ({ one, many }) => ({
-  user: one(users, {
-    fields: [urls.userId],
-    references: [users.id],
-  }),
-  clicks: many(clicks),
-}));
-
-export const clicksRelations = relations(clicks, ({ one }) => ({
-  url: one(urls, {
-    fields: [clicks.urlId],
-    references: [urls.id],
-  }),
-}));
