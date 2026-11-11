@@ -1,384 +1,556 @@
 openapi: 3.0.3
 info:
   title: LinkForge API
-  description: Production-grade, high-throughput URL shortening and analytics platform.
   version: 1.0.0
+  description: |
+    URL shortening, redirects and click analytics.
+
+    **Signing in.** `register`, `login` and `refresh` return a short-lived access
+    token in the response body and set a `refresh_token` cookie (`httpOnly`,
+    `SameSite=Strict`, path `/api/v1/auth`). Send the access token as
+    `Authorization: Bearer <token>`. When it expires (15 minutes), call
+    `POST /api/v1/auth/refresh`; the browser sends the cookie by itself.
+
+    **Errors** always look like this:
+
+    ```json
+    { "error": { "code": "VALIDATION_FAILED", "message": "Some fields are invalid",
+                 "details": [{ "field": "originalUrl", "message": "Enter a public http:// or https:// address" }] } }
+    ```
+
+    **Rate limits.** Responses carry `RateLimit-Limit`, `RateLimit-Remaining` and
+    `RateLimit-Reset` (seconds). A blocked request gets `429` with `Retry-After`.
+  license:
+    name: MIT
 servers:
+  - url: http://localhost:8080
+    description: Docker Compose (through nginx)
   - url: http://localhost:5001
-    description: Local development server
+    description: API run directly in development
+
+tags:
+  - name: Redirect
+  - name: Auth
+  - name: Links
+  - name: Analytics
+  - name: System
 
 paths:
+  /{code}:
+    get:
+      tags: [Redirect]
+      summary: Follow a short link
+      description: |
+        Redirects to the long URL and counts the click. Limited to 600 requests per minute per IP address.
+        The `X-Cache` header says whether the link came from Redis (`HIT`) or PostgreSQL (`MISS`).
+      parameters:
+        - $ref: "#/components/parameters/ShortCode"
+      responses:
+        "302":
+          description: Redirect to the long URL
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+            X-Cache:
+              schema: { type: string, enum: [HIT, MISS] }
+            Cache-Control:
+              schema: { type: string, example: no-store }
+        "404":
+          description: The link does not exist or is paused. HTML for browsers, JSON for API clients.
+        "410":
+          description: The link has expired
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
   /health:
     get:
-      summary: Deep Health Check
-      description: Returns connectivity status and round-trip latency to PostgreSQL and Redis.
+      tags: [System]
+      summary: Health of the API, PostgreSQL and Redis
       responses:
-        '200':
-          description: System healthy
+        "200":
+          description: "`ok`, or `degraded` when Redis is down (the API still serves traffic)"
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HealthResponse'
-        '503':
-          description: System degraded
-
-  /:code:
-    get:
-      summary: Redirect to Destination URL
-      description: Resolves short-code via Redis cache or PostgreSQL, logs click analytics asynchronously, and redirects client.
-      parameters:
-        - name: code
-          in: path
-          required: true
-          schema:
-            type: string
-          example: aB7xK9p
-      responses:
-        '302':
-          description: Found. Redirects to original URL in Location header.
-        '403':
-          description: Link deactivated by owner
-        '404':
-          description: Short code not found
-        '410':
-          description: Link expired
+              schema: { $ref: "#/components/schemas/Health" }
+        "503":
+          description: PostgreSQL is unreachable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
 
   /api/v1/auth/register:
     post:
-      summary: Register New User
-      description: Hashes password with Argon2id and issues initial JWT access token and refresh token family.
+      tags: [Auth]
+      summary: Create an account and start a session
+      description: Limited to 10 requests per 15 minutes per IP address (shared with login).
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RegisterRequest'
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, maxLength: 255 }
+                password:
+                  type: string
+                  minLength: 8
+                  maxLength: 128
+                  description: Needs an uppercase letter, a lowercase letter and a number.
+                name: { type: string, minLength: 2, maxLength: 120 }
       responses:
-        '201':
-          description: User registered successfully
-        '409':
-          description: Email already in use
-        '422':
-          description: Validation error
+        "201":
+          $ref: "#/components/responses/Session"
+        "409":
+          description: An account with this email already exists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+        "429":
+          $ref: "#/components/responses/RateLimited"
 
   /api/v1/auth/login:
     post:
-      summary: User Login
-      description: Verifies credentials, spawns a new refresh token family, sets secure HTTP-only cookie.
+      tags: [Auth]
+      summary: Start a session
+      description: Limited to 10 attempts per 15 minutes per IP address and 20 per account.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/LoginRequest'
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
       responses:
-        '200':
-          description: Authentication successful
-        '401':
-          description: Invalid email or password
+        "200":
+          $ref: "#/components/responses/Session"
+        "401":
+          description: Email or password is incorrect (the same message for both)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+        "429":
+          $ref: "#/components/responses/RateLimited"
 
   /api/v1/auth/refresh:
     post:
-      summary: Refresh Access Token (Token Rotation)
-      description: Exchanges a single-use refresh token for a new token pair. If a revoked token is presented, detects token theft and invalidates the entire family.
+      tags: [Auth]
+      summary: Swap the refresh cookie for a new access token
+      description: |
+        The refresh token works once: this call revokes it and sets a replacement cookie.
+        Presenting a token that was already used (more than 10 seconds ago) revokes every
+        token from that login.
+      security:
+        - refreshCookie: []
       responses:
-        '200':
-          description: New access token issued
-        '401':
-          description: Invalid token or reuse detected
+        "200":
+          $ref: "#/components/responses/Session"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /api/v1/auth/logout:
     post:
-      summary: User Logout
-      description: Revokes active refresh token and clears cookie.
+      tags: [Auth]
+      summary: End the session
+      security:
+        - refreshCookie: []
       responses:
-        '200':
-          description: Logged out successfully
+        "204":
+          description: Signed out; the cookie is cleared
 
   /api/v1/auth/me:
     get:
-      summary: Get Authenticated User Profile
+      tags: [Auth]
+      summary: The signed-in user
       security:
-        - BearerAuth: []
+        - bearerAuth: []
       responses:
-        '200':
-          description: User profile details
-        '401':
-          description: Unauthorized
+        "200":
+          description: The user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /api/v1/urls:
     post:
-      summary: Create Short URL
-      description: Generates a cryptographically random Base62 short-code or validates a custom alias. Supports guest or authenticated requests.
+      tags: [Links]
+      summary: Create a short link
+      description: |
+        Works without an account. When an access token is sent, the link belongs to that user.
+        Limited to 30 links per 15 minutes per user (or per IP address when anonymous).
       security:
-        - BearerAuth: []
         - {}
+        - bearerAuth: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/CreateUrlRequest'
+              type: object
+              required: [originalUrl]
+              properties:
+                originalUrl:
+                  type: string
+                  format: uri
+                  maxLength: 2048
+                  description: A public http or https address. Private, loopback and credential-bearing URLs are refused.
+                  example: https://example.com/a/very/long/address
+                customAlias:
+                  type: string
+                  pattern: "^[A-Za-z0-9_-]{3,30}$"
+                  example: spring-sale
+                expiresAt:
+                  type: string
+                  format: date-time
+                  description: Must be in the future.
       responses:
-        '201':
-          description: Short URL created successfully
-        '409':
-          description: Custom alias conflict
-        '429':
-          description: Rate limit exceeded
-
+        "201":
+          description: The new link
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  link: { $ref: "#/components/schemas/Link" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: The custom alias is already taken
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+        "429":
+          $ref: "#/components/responses/RateLimited"
     get:
-      summary: List User URLs
-      description: Returns paginated list of URLs owned by authenticated user.
+      tags: [Links]
+      summary: List your links, newest first
       security:
-        - BearerAuth: []
+        - bearerAuth: []
       parameters:
-        - name: page
-          in: query
-          schema:
-            type: integer
-            default: 1
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            default: 20
-        - name: search
-          in: query
-          schema:
-            type: string
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: search, in: query, schema: { type: string, maxLength: 100 }, description: Matches the short code or the destination. }
       responses:
-        '200':
-          description: Paginated URL list
+        "200":
+          description: One page of links
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Link" }
+                  pagination:
+                    type: object
+                    properties:
+                      page: { type: integer }
+                      limit: { type: integer }
+                      total: { type: integer }
+                      totalPages: { type: integer }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /api/v1/urls/{id}:
+    parameters:
+      - $ref: "#/components/parameters/LinkId"
     get:
-      summary: Get URL by ID
+      tags: [Links]
+      summary: One of your links
       security:
-        - BearerAuth: []
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - bearerAuth: []
       responses:
-        '200':
-          description: URL details
-        '404':
-          description: Not found
-
+        "200":
+          description: The link
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  link: { $ref: "#/components/schemas/Link" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
     patch:
-      summary: Update URL
+      tags: [Links]
+      summary: Change a link
+      description: Send only the fields to change. The cached copy is removed, so the change applies to the next redirect.
       security:
-        - BearerAuth: []
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - bearerAuth: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/UpdateUrlRequest'
+              type: object
+              minProperties: 1
+              properties:
+                originalUrl: { type: string, format: uri }
+                isActive: { type: boolean, description: "false pauses the link" }
+                expiresAt: { type: string, format: date-time, nullable: true, description: "null removes the expiry" }
       responses:
-        '200':
-          description: URL updated and cache invalidated
-        '403':
-          description: Forbidden
-
+        "200":
+          description: The updated link
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  link: { $ref: "#/components/schemas/Link" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
     delete:
-      summary: Delete URL
+      tags: [Links]
+      summary: Delete a link and its click history
       security:
-        - BearerAuth: []
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - bearerAuth: []
       responses:
-        '200':
-          description: URL deleted and cache invalidated
+        "204":
+          description: Deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
-  /api/v1/urls/{id}/qr:
+  /api/v1/qr/{code}:
     get:
-      summary: Generate QR Code
+      tags: [Links]
+      summary: QR code image for a short link
+      description: Limited to 60 requests per minute per IP address.
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - name: format
-          in: query
-          schema:
-            type: string
-            enum: [png, svg]
-            default: png
+        - $ref: "#/components/parameters/ShortCode"
+        - { name: format, in: query, schema: { type: string, enum: [svg, png], default: svg } }
       responses:
-        '200':
-          description: QR code generated
-
-  /api/v1/analytics/{urlId}/summary:
-    get:
-      summary: URL Click Summary Metrics
-      description: Returns total clicks, clicks past 24h, 7d, 30d, and unique visitors.
-      parameters:
-        - name: urlId
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      responses:
-        '200':
-          description: URL metrics summary
-
-  /api/v1/analytics/{urlId}/timeseries:
-    get:
-      summary: Click Timeseries
-      parameters:
-        - name: urlId
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - name: days
-          in: query
-          schema:
-            type: integer
-            default: 14
-      responses:
-        '200':
-          description: Daily click timeseries
-
-  /api/v1/analytics/{urlId}/breakdown:
-    get:
-      summary: Categorical Click Breakdown
-      description: Returns click counts grouped by device, browser, operating system, and referrer.
-      parameters:
-        - name: urlId
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      responses:
-        '200':
-          description: Categorical breakdown
+        "200":
+          description: The image
+          content:
+            image/svg+xml: { schema: { type: string } }
+            image/png: { schema: { type: string, format: binary } }
+        "404":
+          $ref: "#/components/responses/NotFound"
 
   /api/v1/analytics/overview:
     get:
-      summary: User Dashboard Overview
+      tags: [Analytics]
+      summary: Totals and daily clicks across all your links
       security:
-        - BearerAuth: []
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Days"
       responses:
-        '200':
-          description: Aggregated metrics across user URLs
+        "200":
+          description: Overview
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  days: { type: integer }
+                  totals:
+                    type: object
+                    properties:
+                      links: { type: integer }
+                      activeLinks: { type: integer }
+                      clicks: { type: integer, description: All time }
+                      clicksInRange: { type: integer }
+                  timeseries:
+                    type: array
+                    items: { $ref: "#/components/schemas/DailyClicks" }
+                  topLinks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        shortCode: { type: string }
+                        shortUrl: { type: string, format: uri }
+                        originalUrl: { type: string, format: uri }
+                        clickCount: { type: integer }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/analytics/links/{id}:
+    get:
+      tags: [Analytics]
+      summary: Analytics for one of your links
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/LinkId"
+        - $ref: "#/components/parameters/Days"
+      responses:
+        "200":
+          description: Totals, clicks per day and breakdowns
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  link: { $ref: "#/components/schemas/Link" }
+                  days: { type: integer }
+                  totals:
+                    type: object
+                    properties:
+                      clicks: { type: integer, description: All time }
+                      clicksInRange: { type: integer }
+                      uniqueVisitors: { type: integer, description: Distinct visitor hashes in the range }
+                      clicksLast24h: { type: integer }
+                  timeseries:
+                    type: array
+                    description: One entry per UTC day in the range, including days with no clicks.
+                    items: { $ref: "#/components/schemas/DailyClicks" }
+                  breakdowns:
+                    type: object
+                    description: The top 6 values of each dimension.
+                    properties:
+                      devices: { $ref: "#/components/schemas/Breakdown" }
+                      browsers: { $ref: "#/components/schemas/Breakdown" }
+                      operatingSystems: { $ref: "#/components/schemas/Breakdown" }
+                      referrers: { $ref: "#/components/schemas/Breakdown" }
+                      countries: { $ref: "#/components/schemas/Breakdown" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
 components:
   securitySchemes:
-    BearerAuth:
+    bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: refresh_token
+
+  parameters:
+    ShortCode:
+      name: code
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[A-Za-z0-9_-]{3,32}$" }
+      example: aZ3kP0q
+    LinkId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Days:
+      name: days
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 90, default: 30 }
+
+  responses:
+    Session:
+      description: Session started. Also sets the `refresh_token` cookie.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              user: { $ref: "#/components/schemas/User" }
+              accessToken: { type: string }
+    Unauthorized:
+      description: Missing, invalid or expired credentials
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Not found, or not yours
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationFailed:
+      description: One or more fields are invalid; `details` lists them
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
 
   schemas:
-    HealthResponse:
+    User:
       type: object
       properties:
-        status:
-          type: string
-          example: ok
-        timestamp:
-          type: string
-          format: date-time
-        uptimeSeconds:
-          type: integer
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+    Link:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid, nullable: true, description: null for links made without an account }
+        originalUrl: { type: string, format: uri }
+        shortCode: { type: string, example: aZ3kP0q }
+        shortUrl: { type: string, format: uri, example: "http://localhost:8080/aZ3kP0q" }
+        isCustom: { type: boolean, description: true when the code is a custom alias }
+        clickCount: { type: integer }
+        isActive: { type: boolean }
+        expiresAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    DailyClicks:
+      type: object
+      properties:
+        date: { type: string, format: date, example: "2026-11-10" }
+        clicks: { type: integer }
+    Breakdown:
+      type: array
+      items:
+        type: object
+        properties:
+          name: { type: string, example: Chrome }
+          clicks: { type: integer }
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded, unavailable] }
+        uptimeSeconds: { type: integer }
         database:
           type: object
           properties:
-            status:
-              type: string
-              example: connected
-            latencyMs:
-              type: number
-              example: 45
+            status: { type: string, enum: [up, down] }
+            latencyMs: { type: integer }
         redis:
           type: object
           properties:
-            status:
+            status: { type: string, enum: [up, down, disabled] }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
               type: string
-              example: fallback_mode
-
-    RegisterRequest:
-      type: object
-      required:
-        - email
-        - password
-      properties:
-        email:
-          type: string
-          format: email
-          example: dev@linkforge.io
-        password:
-          type: string
-          format: password
-          example: StrongPass123!
-        name:
-          type: string
-          example: Alex Developer
-
-    LoginRequest:
-      type: object
-      required:
-        - email
-        - password
-      properties:
-        email:
-          type: string
-          format: email
-        password:
-          type: string
-          format: password
-
-    CreateUrlRequest:
-      type: object
-      required:
-        - originalUrl
-      properties:
-        originalUrl:
-          type: string
-          format: uri
-          example: https://github.com/torvalds/linux
-        customAlias:
-          type: string
-          minLength: 3
-          maxLength: 30
-          example: linux-repo
-        expiresAt:
-          type: string
-          format: date-time
-          example: 2026-12-31T23:59:59.000Z
-
-    UpdateUrlRequest:
-      type: object
-      properties:
-        originalUrl:
-          type: string
-          format: uri
-        isActive:
-          type: boolean
-        expiresAt:
-          type: string
-          format: date-time
-          nullable: true
+              enum: [BAD_REQUEST, INVALID_JSON, UNAUTHORIZED, FORBIDDEN, NOT_FOUND, CONFLICT, GONE, PAYLOAD_TOO_LARGE, VALIDATION_FAILED, RATE_LIMITED, CODE_GENERATION_FAILED, INTERNAL_ERROR]
+            message: { type: string }
+            details: {}

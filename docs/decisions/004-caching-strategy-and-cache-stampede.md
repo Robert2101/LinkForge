@@ -1,22 +1,43 @@
-# ADR 004: Redis Caching Strategy, Cache Stampede, and Graceful Fallback
+# ADR 004: Caching short-link lookups in Redis
 
-## Status
-Accepted
+**Status:** accepted
 
 ## Context
-URL redirection is a read-heavy workload (estimated 100:1 read-to-write ratio). Direct database lookups for every redirect would bottleneck PostgreSQL connections and introduce unnecessary latency.
+
+Redirects are by far the most frequent request, and a link almost never changes after it is created. Asking PostgreSQL on every redirect spends a database connection on work whose answer was the same a second ago.
 
 ## Decision
-We implement a **Cache-Aside (Lazy Loading) Architecture** with Redis:
-1. **Lookup Flow:**
-   - Client requests `GET /:code`.
-   - Application checks Redis key `cache:url:{code}`.
-   - **Cache HIT:** Return cached destination URL immediately (~2ms response time).
-   - **Cache MISS:** Query PostgreSQL. If found and active, store in Redis with a 24-hour TTL (with $\pm 10\%$ jitter) and redirect.
-2. **Negative Caching:**
-   - If a short-code does not exist in PostgreSQL, cache a sentinel `__NOT_FOUND__` entry with a short TTL (e.g. 60 seconds) to prevent malicious cache penetration attacks (querying random non-existent URLs to overwhelm the database).
-3. **Cache Invalidation:**
-   - When a URL is updated, deactivated, or deleted by its owner, the corresponding Redis key is explicitly invalidated via `DEL cache:url:{code}`.
-4. **Resilience & Fallback:**
-   - PostgreSQL is the single source of truth.
-   - If Redis connection drops or times out, the application logs a warning and queries PostgreSQL directly without returning 500 errors to users.
+
+**Cache-aside**, implemented in `modules/urls/url.cache.js` and `urlService.resolveShortCode`.
+
+```
+key    link:<short code>
+value  {"id":…,"originalUrl":…,"isActive":…,"expiresAt":…}   or the word "missing"
+```
+
+1. **Read:** `GET link:<code>`. A hit is answered without touching PostgreSQL.
+2. **Miss:** one indexed lookup in PostgreSQL, then the result is written to Redis.
+3. **Write-through on create:** a new link is cached immediately, so its first visitor is already a hit.
+4. **Invalidation:** editing or deleting a link deletes its key, so the change is visible on the next redirect.
+
+The response header `X-Cache: HIT | MISS` reports which path was taken.
+
+### Problems this design handles
+
+| Problem | What it is | Handling |
+|---|---|---|
+| Cache penetration | Requests for codes that do not exist always miss and always reach the database | The miss itself is cached as `"missing"` for 60 seconds. Malformed codes are rejected by a regex before any lookup. |
+| Cache stampede | A popular key expires and many requests query the database at once | An in-process map of lookups in progress: concurrent requests for one code share a single database query. |
+| Cache avalanche | Many keys expire in the same moment | TTLs get ±10% random jitter. |
+| Stale entries | Cached data outlives a change | Explicit delete on update and delete. As a backstop, every entry expires after one hour, and never later than the link's own expiry time. |
+| Redis outage | The cache is unreachable | Every cache call catches its errors and reports "nothing cached". Redirects fall back to PostgreSQL. The Redis client fails fast (1 s command timeout, no offline queue) so an outage does not add latency. |
+
+## Why a JSON string and not a Redis hash
+
+The whole object is always read together and never updated field by field, so one `GET` of a small string is the cheapest shape.
+
+## Consequences
+
+- If a delete fails during a Redis blip, a stale entry can live until its TTL runs out (at most about an hour).
+- The stampede protection is per process. With several app instances, each can run one query for the same cold key.
+- Redis runs with `maxmemory` and `allkeys-lru`, so it evicts the least recently used links when full.

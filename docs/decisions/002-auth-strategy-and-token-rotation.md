@@ -1,27 +1,35 @@
-# ADR 002: Authentication Strategy and Refresh Token Rotation
+# ADR 002: Access tokens plus rotating refresh tokens
 
-## Status
-Accepted
+**Status:** accepted
 
 ## Context
-LinkForge requires authentication to allow users to manage custom URLs, review click analytics, and configure expiration. We evaluated authentication schemes:
-1. Stateful Server-Side Sessions with Redis
-2. Basic JWT stored in browser `localStorage`
-3. JWT Access Tokens + Database-backed Refresh Token Rotation with secure HTTP-only cookies
+
+Users sign in to manage links and read analytics. The options were server-side sessions, a long-lived JWT in `localStorage`, or a short-lived access token with a refresh token.
 
 ## Decision
-We chose **JWT Access Tokens (short-lived, 15m) paired with Refresh Token Rotation (long-lived, 7d)** using secure `httpOnly` cookies.
 
-### Key Mechanisms:
-1. **Token Family Tracking:** Every refresh token belongs to a `familyId`.
-2. **One-Time Use:** When a refresh token is used to generate a new access token, the old refresh token is marked as revoked/used, and a new refresh token is issued within the same family.
-3. **Breach / Reuse Detection:** If an already-revoked refresh token is presented (indicating a replay or stolen token scenario), the system automatically revokes the **entire family** of tokens, immediately invalidating the attacker and the legitimate user sessions.
-4. **Password Hashing:** Argon2id is used instead of bcrypt because of its superior resistance to GPU/ASIC-based brute-force attacks and memory-hard design (winner of the Password Hashing Competition).
+| | Access token | Refresh token |
+|---|---|---|
+| What it is | JWT signed with HS256 | 32 random bytes (not a JWT) |
+| Lifetime | 15 minutes | 7 days |
+| Where the browser keeps it | JavaScript memory only | `httpOnly`, `SameSite=Strict` cookie, path `/api/v1/auth` |
+| How the server checks it | Verifies the signature; no database query | Looks up its SHA-256 hash in `refresh_tokens` |
 
-## Consequences & Trade-offs
-* **Pros:**
-  * Stateless verification of requests via access token (fast, no database query needed on each authorized API request).
-  * Robust protection against XSS (refresh tokens cannot be read by JavaScript because of `httpOnly`).
-  * Instant mitigation against stolen refresh tokens through family invalidation.
-* **Cons:**
-  * Requires a database lookup during token refresh (mitigated because refreshes happen once every 15 minutes, not on every API call).
+- Passwords are hashed with **Argon2id** (19 MiB memory, 2 iterations, the OWASP recommendation).
+- **Rotation:** a refresh token works exactly once. Using it revokes it and issues a replacement in the same *family* (all tokens descended from one login).
+- **Reuse detection:** if a token that was used more than 10 seconds ago is presented again, someone holds a copy they should not have, so the whole family is revoked. Within 10 seconds a repeat is treated as a duplicate request and simply refused.
+- The "check it is unused, then mark it used" step is a single `UPDATE … WHERE revoked_at IS NULL RETURNING`, so two simultaneous requests with the same token cannot both succeed.
+
+## Why
+
+- A 15-minute access token keeps API requests free of database lookups, and limits the damage of a leaked token.
+- The refresh token never reaches JavaScript, so a cross-site-scripting bug cannot steal the long-lived credential.
+- `SameSite=Strict` plus a path limited to the auth routes means the cookie is not sent on requests triggered by other sites (CSRF).
+- Storing only a hash means a database leak does not hand out working sessions.
+- An opaque random refresh token is simpler than a JWT here: it has to be looked up in the database anyway, so a signature adds nothing.
+
+## Consequences
+
+- Sign-out cannot recall an access token already issued; it stays valid for up to 15 minutes.
+- Two browser tabs refreshing at once would race for the single-use token. The web app serialises refreshes across tabs with the Web Locks API, and the 10-second grace period covers what is left.
+- Sign-in also throttles guessing: 10 attempts per 15 minutes per IP address and 20 per account.

@@ -1,28 +1,40 @@
-# ADR 006: Modular Monolith Architecture
+# ADR 006: One deployable service, organised in modules
 
-## Status
-Accepted
+**Status:** accepted
 
 ## Context
-Distributed microservices introduce substantial operational complexity: distributed transactions, network latency, distributed tracing overhead, message broker coordination, and container orchestration overhead. For LinkForge's initial development and placement defense, a clean architectural boundary inside a single deployable unit is optimal.
+
+The API could be one service or several (auth, links, analytics). Separate services bring network calls between them, distributed tracing, and several deployments to coordinate. Nothing about this application's size needs that yet.
 
 ## Decision
-We structure the application as a **Modular Monolith**:
-- Single Express application and process deployment.
-- Domain modules isolated in `src/modules/`:
-  - `auth/`: User credentials, token rotation, sessions.
-  - `urls/`: URL generation, resolution, expiration, QR codes.
-  - `analytics/`: Click event ingestion, aggregation, metrics.
-- Strict layered architecture inside each module:
-  ```
-  HTTP Request ──► Controller ──► Service ──► Repository ──► Database
-  ```
-  - **Controller:** Express routing, HTTP status codes, deserialization.
-  - **Service:** Core business rules (entropy, collision checks, token issuance).
-  - **Repository:** Drizzle ORM / SQL query execution.
-  - **Validation:** Zod schemas.
 
-## Benefits:
-- Single deployment artifact (ECS container or local Node process).
-- Zero network latency between domains.
-- Clear domain boundaries that can be cleanly refactored into microservices if volume justifies it.
+One Express application, split into modules under `backend/src/modules`:
+
+- `auth` — accounts and sessions
+- `urls` — creating, managing and resolving links, QR codes, the redirect
+- `analytics` — recording clicks and reporting on them
+- `health` — the health endpoint
+
+Every module has the same three layers, and a request passes through them in one direction:
+
+```
+routes  →  service  →  repository  →  PostgreSQL
+(HTTP)     (rules)     (SQL)
+```
+
+- **routes**: URL, middleware (auth, rate limit, validation), status code. Handlers are a line or two.
+- **service**: what the application does. Knows nothing about HTTP.
+- **repository**: every SQL statement for that module's tables. Nothing else talks to the database.
+
+Shared code lives in `lib/` (logger, Redis client, error type) and `middleware/`.
+
+## Why
+
+- A new reader can find anything by asking "which module, which layer".
+- Services are testable without HTTP, and SQL is all in one place per module when a query needs tuning.
+- Express 5 forwards rejected promises to the error handler, so handlers `throw` and need no `try/catch`. That removed a separate controller layer: route files stay short without it.
+
+## Consequences
+
+- Modules call each other's services directly (analytics asks the urls service who owns a link). That is fine in one process; it is the seam along which a module could later become its own service.
+- All modules scale together. If redirects ever need far more capacity than the dashboard, the redirect path is the first candidate to split out.

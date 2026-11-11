@@ -1,20 +1,27 @@
-# ADR 001: Database Selection and Data Access Strategy
+# ADR 001: PostgreSQL, two transports and Drizzle
 
-## Status
-Accepted
+**Status:** accepted
 
 ## Context
-LinkForge requires a reliable, ACID-compliant persistence layer for storing users, shortened URLs, and click events. We evaluated multiple database options (local Docker Postgres, AWS RDS Free Tier, Neon Serverless Postgres) and data access layers (Prisma ORM, Drizzle ORM, raw SQL with `pg`).
+
+LinkForge stores users, links, sessions and click events. The data is relational (a click belongs to a link, a link belongs to a user), uniqueness matters (short codes, emails), and the analytics are aggregations over time ranges.
 
 ## Decision
-1. **Database:** PostgreSQL hosted on **Neon Serverless**.
-2. **Data Access Layer:** Direct SQL execution using the native Node.js **`pg` (node-postgres)** driver with connection pooling.
 
-## Consequences & Trade-offs
-* **Why Neon over AWS RDS (at this stage):**
-  * AWS RDS free tier carries hidden cost risks (automated snapshots, egress, forgetting instances active).
-  * Neon offers a true serverless PostgreSQL instance with zero credit card risk, separation of storage and compute, and branchable databases.
-* **Why raw `pg` over Prisma:**
-  * Prisma abstracts SQL generation behind a heavy compiled query engine binary.
-  * Writing raw SQL with `pg` and connection pools provides complete visibility over query performance, indexes, and execution plans (`EXPLAIN ANALYZE`), which is critical for mastering production database design and 20 LPA interview discussions.
-  * Higher-level query builders or ORMs (e.g., Drizzle) can be introduced later if schema complexity demands it.
+- **PostgreSQL** as the only source of truth.
+- The standard **`pg` (node-postgres)** driver with one connection pool per process, and Neon's WebSocket driver as an opt-in alternative transport.
+- **Drizzle** as a thin, typed query builder on top of it. No Prisma.
+- **Hand-written SQL migrations** in `backend/migrations`, applied in filename order by `src/db/migrate.js`.
+
+## Why
+
+- **PostgreSQL over MongoDB.** Short-code uniqueness is enforced by a `UNIQUE` constraint, which is what makes "two requests for the same alias" safe without application locks. Foreign keys with `ON DELETE CASCADE` remove a link's clicks with it. Analytics need `GROUP BY`, `count(DISTINCT …)`, `FILTER` and `GROUPING SETS`, which are one query each in SQL.
+- **`pg` by default, Neon's WebSocket driver as an option.** The first version used only Neon's WebSocket driver, which can talk to nothing but Neon, so it could not connect to the PostgreSQL in Docker Compose or CI. The standard `pg` driver works with every PostgreSQL and is the default. The WebSocket driver is kept behind `DATABASE_DRIVER=neon-websocket` for one real situation: networks that reset PostgreSQL traffic on port 5432. It carries the same protocol inside a WebSocket on port 443. Both expose the same pool API, and the choice is made in one file, `src/db/connect.js`.
+- **Drizzle over Prisma.** Drizzle generates the SQL you would have written and has no query-engine binary. Where the builder gets in the way (batched click insert, `GROUPING SETS`) the code drops to raw SQL through the same connection.
+- **SQL migrations over generated ones.** Index changes, column renames and backfills are easier to review as plain SQL, and each file states why it exists.
+
+## Consequences
+
+- The pool size (`DATABASE_POOL_MAX`, default 10) caps concurrent queries per process. With many app instances, a pooler such as PgBouncer (or Neon's pooled endpoint) is needed in front of PostgreSQL.
+- The table definitions in `src/db/schema.js` and the SQL migrations must be kept in step by hand.
+- The automated tests run on the `pg` driver. The WebSocket transport is exercised by connecting to a real Neon database, since it cannot talk to a plain PostgreSQL.

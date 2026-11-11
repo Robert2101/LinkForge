@@ -1,31 +1,30 @@
-# ADR 003: Short-Code Generation and Collision Handling
+# ADR 003: Random Base62 short codes
 
-## Status
-Accepted
+**Status:** accepted
 
 ## Context
-Short-codes represent the unique identifiers in short URLs (e.g., `https://linkforge.com/aB7xK9`). We analyzed three primary generation approaches:
-1. **Auto-Incrementing Sequence ID / Snowflake ID encoded to Base62:**
-   - Pros: Guaranteed uniqueness without collisions.
-   - Cons: Predictable (`/10001`, `/10002`) allowing malicious actors to enumerate links, estimate platform volume, or target private/unlisted links.
-2. **MD5 / SHA-256 Hash of Destination URL truncated to 7 characters:**
-   - Pros: Deterministic.
-   - Cons: Two users shortening the same URL produce the same short-code unless salt is added. More importantly, high collision probability at truncation.
-3. **Cryptographically Random Base62 String (Length 7):**
-   - Characters: `[0-9a-zA-Z]` (62 possible characters).
-   - Space: $62^7 \approx 3.52 \times 10^{12}$ (over 3.5 trillion unique permutations).
+
+A short code is the part after the slash. Three ways to produce one:
+
+1. **Counter encoded in Base62.** Never collides, but codes are guessable: anyone can walk `/1`, `/2`, `/3` and read every link, and the latest code reveals how many links exist. A counter is also a point of coordination between servers.
+2. **Hash of the long URL, truncated.** Two people shortening the same URL would get the same code and share one link, with shared analytics and shared ownership problems.
+3. **Random characters.**
 
 ## Decision
-We chose **Cryptographically Random Base62 (Length 7) generated using `crypto.randomBytes`**, backed by a PostgreSQL unique index and a deterministic collision-retry loop.
 
-### Collision Handling Algorithm:
-1. Generate a candidate 7-character Base62 string using CSPRNG bytes.
-2. Attempt insertion into PostgreSQL.
-3. If PostgreSQL returns error code `23505` (`unique_violation`), increment retry counter (up to 5 attempts) and generate a new candidate.
-4. If retries exhaust (probability $< 10^{-15}$ at current scale), return an operational error.
+Seven random characters from `0-9 a-z A-Z`, generated with `crypto.randomBytes`.
 
-## Custom Alias Handling
-Custom aliases (e.g. `/my-brand`) bypass random generation but undergo:
-- Alphanumeric + hyphen/underscore validation (`^[a-zA-Z0-9_-]{3,30}$`).
-- Reserved word blocking (e.g., `api`, `health`, `auth`, `admin`, `dashboard`).
-- PostgreSQL `UNIQUE` constraint enforcement to eliminate race conditions between concurrent requests.
+- **Size of the space:** 62⁷ ≈ 3.5 trillion codes.
+- **No modulo bias:** a random byte is 0–255 and 256 is not a multiple of 62, so `byte % 62` would favour the first eight characters. Bytes of 248 and above are discarded (248 = 62 × 4).
+- **Uniqueness is the database's job.** The code is inserted with `INSERT … ON CONFLICT (short_code) DO NOTHING RETURNING`. No row back means the code was taken, so a new one is generated, up to five times. There is no "check if free, then insert" step for another request to slip between.
+- **Custom aliases** go through the same insert. A conflict there is reported as `409` because the user chose that name. Aliases are 3–30 characters of letters, digits, `-` and `_`, and may not be one of the reserved names the app itself uses (`api`, `login`, `dashboard`, …).
+
+## How likely is a collision?
+
+With *n* links stored, one new random code collides with probability *n* / 62⁷. At one million links that is about 1 in 3.5 million per insert; at one billion links, about 1 in 3,500. Five attempts make failure at realistic sizes practically impossible, and the code length can be raised to 8 (218 trillion) when the table grows.
+
+## Consequences
+
+- Codes cannot be enumerated, and they reveal nothing about volume.
+- A rare extra insert on collision, instead of a guaranteed-unique counter.
+- Codes are case-sensitive.
