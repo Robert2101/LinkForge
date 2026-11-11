@@ -1,34 +1,35 @@
-# Multi-stage production Dockerfile for LinkForge Backend
-# 1. Base stage
-FROM node:24-alpine AS base
-WORKDIR /app
-RUN apk add --no-cache curl
+# syntax=docker/dockerfile:1
 
-# 2. Dependencies stage
-FROM base AS dependencies
-COPY package*.json ./
+# ---- Stage 1: install production dependencies -------------------------------
+# Done in its own stage so the final image holds no npm cache or build tools.
+# Copying only the two package files first means Docker reuses this layer
+# until a dependency actually changes.
+FROM node:24-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-# 3. Production runtime stage
-FROM base AS runner
+# ---- Stage 2: the image that runs ------------------------------------------
+FROM node:24-alpine
+ENV NODE_ENV=production \
+    PORT=5001
 WORKDIR /app
-ENV NODE_ENV=production
-ENV PORT=5001
 
-# Run as non-privileged node user for security hardening
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json ./
+COPY migrations ./migrations
+COPY src ./src
+
+# Never run as root: if the app is compromised, the attacker is an
+# unprivileged user inside the container.
 USER node
-
-# Copy dependencies from dependencies stage
-COPY --chown=node:node --from=dependencies /app/node_modules ./node_modules
-COPY --chown=node:node package*.json ./
-COPY --chown=node:node drizzle.config.js ./
-COPY --chown=node:node drizzle ./drizzle
-COPY --chown=node:node src ./src
 
 EXPOSE 5001
 
-# Container healthcheck against deep health endpoint
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -f http://localhost:5001/health || exit 1
+# Docker marks the container unhealthy (and compose/orchestrators react) when
+# the API or its database stops answering.
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:' + process.env.PORT + '/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
+# Run node directly (not through npm) so it receives SIGTERM and can shut down cleanly.
 CMD ["node", "src/server.js"]

@@ -1,9 +1,13 @@
 node_modules
 npm-debug.log
 .env
-.env.local
+.env.*
 .git
 .gitignore
 tests
+scripts
 coverage
+eslint.config.js
+Dockerfile
+.dockerignore
 .DS_Store

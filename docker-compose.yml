@@ -1,60 +1,102 @@
-services:
-  backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    container_name: linkforge-backend
-    restart: unless-stopped
-    ports:
-      - "5001:5001"
-    environment:
-      - NODE_ENV=development
-      - PORT=5001
-      - BASE_URL=http://localhost:5001
-      - CORS_ORIGIN=http://localhost:5173
-      - DATABASE_URL=postgresql://linkforge:forgepass@postgres:5432/linkforge_db
-      - REDIS_URL=redis://redis:6379
-      - JWT_ACCESS_SECRET=linkforge-super-secret-jwt-access-key-32chars!
-      - JWT_REFRESH_SECRET=linkforge-super-secret-jwt-refresh-key-32chars!
-      - COOKIE_SECRET=linkforge-super-secret-cookie-key-min16!
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+# The whole application, production style:
+#
+#   browser ──> web (nginx :8080) ──> backend (Node :5001) ──> postgres
+#                 serves the app          API + redirects    └─> redis
+#
+# First run:
+#   1. Create a .env file next to this one (see .env.example for the one-line command).
+#   2. docker compose up --build
+#   3. Open http://localhost:8080
+#
+# Only the web container is reachable from outside. The backend, Postgres and
+# Redis sit on a private network; the two databases are also published on
+# 127.0.0.1 so you can run the backend with `npm run dev` against them.
 
+name: linkforge
+
+services:
   postgres:
     image: postgres:16-alpine
-    container_name: linkforge-postgres
     restart: unless-stopped
     environment:
-      - POSTGRES_USER=linkforge
-      - POSTGRES_PASSWORD=forgepass
-      - POSTGRES_DB=linkforge_db
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: linkforge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Create a .env file first - see .env.example}
+      POSTGRES_DB: linkforge
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U linkforge -d linkforge_db"]
+      test: ["CMD-SHELL", "pg_isready -U linkforge -d linkforge"]
       interval: 5s
-      timeout: 5s
-      retries: 5
+      timeout: 3s
+      retries: 10
 
   redis:
     image: redis:7-alpine
-    container_name: linkforge-redis
     restart: unless-stopped
+    # Redis is used as a cache here, so:
+    #   - cap its memory and evict the least recently used keys when full
+    #   - do not write snapshots to disk (losing the cache on restart is fine)
+    command: ["redis-server", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru", "--save", "", "--appendonly", "no"]
     ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
-      timeout: 5s
-      retries: 5
+      timeout: 3s
+      retries: 10
+
+  # Runs once, applies any new database migrations, then exits.
+  # The backend waits for it, so it never starts against an outdated schema.
+  migrate:
+    build: ./backend
+    command: ["node", "src/db/migrate.js"]
+    environment:
+      DATABASE_URL: postgresql://linkforge:${POSTGRES_PASSWORD}@postgres:5432/linkforge
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 5001
+      # The public address people type. Short links are built from it.
+      BASE_URL: ${BASE_URL:-http://localhost:8080}
+      CORS_ORIGIN: ${BASE_URL:-http://localhost:8080}
+      # Exactly one proxy (the web container's nginx) sits in front of the backend.
+      TRUST_PROXY: 1
+      DATABASE_URL: postgresql://linkforge:${POSTGRES_PASSWORD}@postgres:5432/linkforge
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?Create a .env file first - see .env.example}
+      IP_HASH_SALT: ${IP_HASH_SALT:?Create a .env file first - see .env.example}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    # Hardening: the app needs no write access to its own filesystem, no extra
+    # Linux capabilities, and must not be able to gain new privileges.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    stop_grace_period: 15s # time to finish requests and flush buffered clicks
+
+  web:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
 
 volumes:
-  postgres_data:
-  redis_data:
+  pgdata:

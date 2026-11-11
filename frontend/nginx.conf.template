@@ -1,0 +1,74 @@
+# nginx is the single public entry point. It does three jobs:
+#   1. serves the built web app (static files)
+#   2. forwards /api/... to the backend
+#   3. forwards every other path (/aZ3kP0q) to the backend as a short link
+#
+# Because the browser only ever talks to this one origin, there is no CORS in
+# production and the refresh-token cookie is a same-site cookie.
+
+server {
+  listen 8080;
+  server_name _;
+  root /usr/share/nginx/html;
+
+  server_tokens off;            # do not advertise the nginx version
+  client_max_body_size 16k;     # nothing we accept is bigger than a URL
+
+  # --- Security headers for the web app ------------------------------------
+  # (The backend sets its own headers on the responses it produces.)
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header X-Frame-Options "DENY" always;
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+  # Scripts may only come from our own files: an injected <script> will not run.
+  # Inline *styles* are allowed because the charts set bar heights with style="".
+  add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
+
+  gzip on;
+  gzip_types text/css application/javascript application/json image/svg+xml;
+  gzip_min_length 1024;
+
+  location = /nginx-health {
+    access_log off;
+    default_type text/plain;
+    return 200 "ok\n";
+  }
+
+  # --- 1. The web app -------------------------------------------------------
+  # Files under /assets have a content hash in their name, so they can be
+  # cached forever. index.html must always be fresh so new deploys are seen.
+  location /assets/ {
+    expires 1y;
+    try_files $uri =404;
+  }
+
+  # The app's own pages. They all load index.html; React Router takes over.
+  location = / {
+    expires -1;
+    try_files /index.html =404;
+  }
+  location ~ ^/(login|register|dashboard|links)(/|$) {
+    expires -1;
+    try_files /index.html =404;
+  }
+
+  # --- 2. The API -----------------------------------------------------------
+  location /api/ {
+    proxy_pass ${BACKEND_URL};
+    include /etc/nginx/conf.d/proxy-headers.inc;
+  }
+  location = /health {
+    proxy_pass ${BACKEND_URL};
+    include /etc/nginx/conf.d/proxy-headers.inc;
+  }
+
+  # --- 3. Short links -------------------------------------------------------
+  # A real file (favicon.svg, robots.txt) wins; anything else is a short code.
+  location / {
+    try_files $uri @short_link;
+  }
+  location @short_link {
+    proxy_pass ${BACKEND_URL};
+    include /etc/nginx/conf.d/proxy-headers.inc;
+  }
+}
