@@ -1,0 +1,248 @@
+@import "tailwindcss";
+@import "@fontsource-variable/archivo/wdth.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+
+/*
+  Design tokens. The look is "cool steel, one hot edge":
+  a pale steel page, slate ink, and a single ember colour that is reserved for
+  the primary action and the freshly made short link. Nothing else is orange.
+*/
+@theme {
+  --font-sans: "Archivo Variable", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+
+  --color-paper: #eef1f4;
+  --color-surface: #ffffff;
+  --color-ink: #16202b;
+  --color-muted: #52606d;
+  --color-line: #cdd5dd;
+  --color-line-strong: #98a5b2;
+
+  --color-ember: #c2410c;
+  --color-ember-dark: #9a330a;
+  --color-ember-hot: #f26a1b;
+  --color-ember-wash: #fdeee4;
+
+  /* Chart colour, checked with the dataviz palette validator. */
+  --color-data: #2f6da8;
+  --color-data-wash: #dde8f2;
+
+  --color-good: #17693f;
+  --color-good-wash: #e2f3ea;
+  --color-warn: #7a5200;
+  --color-warn-wash: #fbf0d4;
+  --color-danger: #b42318;
+  --color-danger-wash: #fde9e7;
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    background: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 1rem;
+    line-height: 1.5;
+    touch-action: manipulation;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+
+  /* One focus style everywhere, shown for keyboard users only. */
+  :focus-visible {
+    outline: 2px solid var(--color-ink);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: var(--color-ember-wash);
+  }
+
+  dialog::backdrop {
+    background: rgb(22 32 43 / 0.55);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  /* Headings use Archivo's wide cut: broad, heavy, like stamped steel. */
+  .display {
+    font-stretch: 122%;
+    font-weight: 800;
+    letter-spacing: -0.015em;
+    line-height: 1.04;
+  }
+
+  .heading {
+    font-stretch: 112%;
+    font-weight: 700;
+    letter-spacing: -0.005em;
+    line-height: 1.2;
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    min-height: 2.75rem;
+    padding: 0 1.125rem;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+    transition:
+      background-color 120ms,
+      border-color 120ms,
+      color 120ms;
+  }
+  .btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+  }
+
+  .btn-primary {
+    background: var(--color-ember);
+    color: #fff;
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: var(--color-ember-dark);
+  }
+
+  .btn-secondary {
+    background: var(--color-surface);
+    border-color: var(--color-line-strong);
+    color: var(--color-ink);
+  }
+  .btn-secondary:hover:not(:disabled) {
+    border-color: var(--color-ink);
+  }
+
+  .btn-quiet {
+    min-height: 2.25rem;
+    padding: 0 0.625rem;
+    color: var(--color-muted);
+  }
+  .btn-quiet:hover:not(:disabled) {
+    background: rgb(22 32 43 / 0.07);
+    color: var(--color-ink);
+  }
+
+  .btn-danger {
+    background: var(--color-danger);
+    color: #fff;
+  }
+  .btn-danger:hover:not(:disabled) {
+    background: #8f1c13;
+  }
+
+  .input {
+    width: 100%;
+    min-height: 2.75rem;
+    padding: 0 0.75rem;
+    border-radius: 6px;
+    border: 1px solid var(--color-line-strong);
+    background: var(--color-surface);
+    color: var(--color-ink);
+  }
+  .input::placeholder {
+    color: #7b8794;
+  }
+  .input:hover {
+    border-color: var(--color-ink);
+  }
+  .input[aria-invalid="true"] {
+    border-color: var(--color-danger);
+  }
+
+  .label {
+    display: block;
+    margin-bottom: 0.375rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+  }
+
+  .field-error {
+    margin-top: 0.375rem;
+    font-size: 0.875rem;
+    color: var(--color-danger);
+  }
+
+  .link {
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+  }
+  .link:hover {
+    text-decoration-thickness: 2px;
+  }
+
+  .panel {
+    background: var(--color-surface);
+    border: 1px solid var(--color-line);
+    border-radius: 8px;
+  }
+}
+
+/*
+  The one piece of choreography on the site: a new short link is "struck".
+  It lands wide and hot, snaps to size, and the heat fades out of it.
+*/
+@keyframes strike {
+  0% {
+    opacity: 0;
+    transform: scaleX(1.35);
+  }
+  55% {
+    opacity: 1;
+    transform: scaleX(0.985);
+  }
+  100% {
+    opacity: 1;
+    transform: scaleX(1);
+  }
+}
+@keyframes cool {
+  0% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+.struck {
+  transform-origin: left center;
+  animation: strike 520ms cubic-bezier(0.2, 0.9, 0.25, 1) both;
+}
+.struck-heat {
+  animation: cool 1600ms ease-out 200ms both;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spinner {
+  animation: spin 700ms linear infinite;
+}
