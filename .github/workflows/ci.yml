@@ -1,4 +1,4 @@
-name: LinkForge CI Pipeline
+name: CI
 
 on:
   push:
@@ -6,26 +6,39 @@ on:
   pull_request:
     branches: [main]
 
-jobs:
-  test:
-    name: Lint, Test & Validate
-    runs-on: ubuntu-latest
+# The workflow only needs to read the code. Nothing here can push or publish.
+permissions:
+  contents: read
 
+# A newer push to the same branch cancels the run that is now out of date.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (lint, audit, tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    # The tests run against a real Postgres and a real Redis, the same
+    # versions as production, not mocks.
     services:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_USER: test_user
-          POSTGRES_PASSWORD: test_password
+          POSTGRES_USER: linkforge
+          POSTGRES_PASSWORD: linkforge
           POSTGRES_DB: linkforge_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U linkforge -d linkforge_test"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 5
-
+          --health-retries 10
       redis:
         image: redis:7-alpine
         ports:
@@ -34,53 +47,75 @@ jobs:
           --health-cmd "redis-cli ping"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
+
+    env:
+      NODE_ENV: test
+      BASE_URL: http://localhost:5001
+      DATABASE_URL: postgresql://linkforge:linkforge@localhost:5432/linkforge_test
+      REDIS_URL: redis://localhost:6379/1
+      TRUST_PROXY: 1
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js 24
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: "npm"
+          cache: npm
           cache-dependency-path: backend/package-lock.json
 
-      - name: Install Dependencies
-        working-directory: ./backend
-        run: npm ci
-
-      - name: Run Database Migrations
-        working-directory: ./backend
-        env:
-          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/linkforge_test
-          NODE_ENV: test
-        run: node src/db/migrate.js
-
-      - name: Run Unit & Integration Tests
-        working-directory: ./backend
-        env:
-          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/linkforge_test
-          REDIS_URL: redis://localhost:6379
-          NODE_ENV: test
-          JWT_ACCESS_SECRET: test-access-secret-minimum-32-characters-key!
-          JWT_REFRESH_SECRET: test-refresh-secret-minimum-32-characters-key!
+      - run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Check production dependencies for known vulnerabilities
+        run: npm audit --omit=dev --audit-level=high
+      - name: Apply database migrations
+        run: npm run test:migrate
+      - name: Run unit and integration tests
         run: npm test
 
-  docker-build:
-    name: Verify Docker Image Build
+  frontend:
+    name: Frontend (lint, tests, build)
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Check production dependencies for known vulnerabilities
+        run: npm audit --omit=dev --audit-level=high
+      - name: Run unit tests
+        run: npm test
+      - name: Build
+        run: npm run build
 
-      - name: Build Backend Docker Image
-        uses: docker/build-push-action@v5
+  docker:
+    name: Docker images build
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build backend image
+        uses: docker/build-push-action@v6
         with:
           context: ./backend
           push: false
-          tags: linkforge-backend:latest
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+      - name: Build web image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,scope=web,mode=max
