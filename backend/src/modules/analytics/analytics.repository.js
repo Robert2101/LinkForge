@@ -1,199 +1,129 @@
-import { eq, and, desc, sql, gte } from "drizzle-orm";
-import { db } from "../../lib/db.js";
+import { and, count, desc, eq, gte, sql, sum } from "drizzle-orm";
+import { db } from "../../db/client.js";
 import { clicks, urls } from "../../db/schema.js";
 
+// All SQL for click analytics lives here.
+// Every read filters by url_id plus a time range, which is exactly what the
+// (url_id, clicked_at) index on the clicks table is built for.
+
+// Clicks are grouped by calendar day in UTC, e.g. "2026-11-10".
+const clickDay = sql`to_char(${clicks.clickedAt} at time zone 'UTC', 'YYYY-MM-DD')`;
+
 export const analyticsRepository = {
-  /**
-   * Persist a click record and atomically increment the URL's counter
-   */
-  async recordClick({
-    urlId,
-    ipHash,
-    userAgent,
-    browser,
-    os,
-    device,
-    referrer,
-    country,
-  }) {
-    await Promise.all([
-      db.insert(clicks).values({
-        urlId,
-        ipHash,
-        userAgent,
-        browser,
-        os,
-        device,
-        referrer,
-        country,
-      }),
-      db
-        .update(urls)
-        .set({
-          clickCount: sql`${urls.clickCount} + 1`,
-          updatedAt: new Date(),
-        })
-        .where(eq(urls.id, urlId)),
-    ]);
+  // Saves a batch of clicks and adds them to each link's click_count.
+  // One statement = one round trip to the database and one transaction:
+  // the counters and the click rows can never disagree.
+  async insertClicks(batch) {
+    await db.execute(sql`
+      -- 1. Turn the JSON array sent by the app into rows.
+      with incoming as (
+        select *
+        from jsonb_to_recordset(${JSON.stringify(batch)}::jsonb) as click(
+          "urlId" uuid, "clickedAt" timestamptz, "ipHash" text,
+          "browser" text, "os" text, "device" text, "referrer" text, "country" text
+        )
+      ),
+      -- 2. Add the number of new clicks to each link. Links deleted in the
+      --    meantime are simply not returned.
+      counted as (
+        update urls
+        set click_count = urls.click_count + totals.new_clicks
+        from (
+          select "urlId", count(*)::int as new_clicks from incoming group by "urlId"
+        ) as totals
+        where urls.id = totals."urlId"
+        returning urls.id
+      )
+      -- 3. Store the individual clicks, only for links that still exist.
+      insert into clicks (url_id, clicked_at, ip_hash, browser, os, device, referrer, country)
+      select "urlId", "clickedAt", "ipHash", "browser", "os", "device", "referrer", "country"
+      from incoming
+      join counted on counted.id = incoming."urlId"
+    `);
   },
 
-  /**
-   * High-level summary metrics for a specific URL
-   */
-  async getSummary(urlId) {
-    const now = new Date();
-    const past24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-    const past7d = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-    const past30d = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-
-    const [totalClicksRow] = await db
-      .select({ count: sql`count(*)` })
-      .from(clicks)
-      .where(eq(clicks.urlId, urlId));
-
-    const [clicks24hRow] = await db
-      .select({ count: sql`count(*)` })
-      .from(clicks)
-      .where(and(eq(clicks.urlId, urlId), gte(clicks.timestamp, past24h)));
-
-    const [clicks7dRow] = await db
-      .select({ count: sql`count(*)` })
-      .from(clicks)
-      .where(and(eq(clicks.urlId, urlId), gte(clicks.timestamp, past7d)));
-
-    const [clicks30dRow] = await db
-      .select({ count: sql`count(*)` })
-      .from(clicks)
-      .where(and(eq(clicks.urlId, urlId), gte(clicks.timestamp, past30d)));
-
-    const [uniqueVisitorsRow] = await db
-      .select({ count: sql`count(distinct ${clicks.ipHash})` })
-      .from(clicks)
-      .where(eq(clicks.urlId, urlId));
-
-    return {
-      totalClicks: Number(totalClicksRow?.count || 0),
-      clicks24h: Number(clicks24hRow?.count || 0),
-      clicks7d: Number(clicks7dRow?.count || 0),
-      clicks30d: Number(clicks30dRow?.count || 0),
-      uniqueVisitors: Number(uniqueVisitorsRow?.count || 0),
-    };
-  },
-
-  /**
-   * Click counts grouped by date for timeseries charts
-   */
-  async getTimeSeries(urlId, days = 14) {
-    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-
-    const rows = await db
+  // Headline numbers for one link, computed in a single pass over the index range.
+  async linkTotals(urlId, since) {
+    const [row] = await db
       .select({
-        date: sql`to_char(${clicks.timestamp}, 'YYYY-MM-DD')`,
-        count: sql`count(*)`,
+        clicksInRange: count(),
+        uniqueVisitors: sql`count(distinct ${clicks.ipHash})`.mapWith(Number),
+        clicksLast24h:
+          sql`count(*) filter (where ${clicks.clickedAt} >= now() - interval '24 hours')`.mapWith(Number),
       })
       .from(clicks)
-      .where(and(eq(clicks.urlId, urlId), gte(clicks.timestamp, cutoff)))
-      .groupBy(sql`to_char(${clicks.timestamp}, 'YYYY-MM-DD')`)
-      .orderBy(sql`to_char(${clicks.timestamp}, 'YYYY-MM-DD') ASC`);
-
-    return rows.map((r) => ({
-      date: r.date,
-      clicks: Number(r.count),
-    }));
+      .where(and(eq(clicks.urlId, urlId), gte(clicks.clickedAt, since)));
+    return row;
   },
 
-  /**
-   * Categorical breakdown by device, browser, OS, and referrer
-   */
-  async getBreakdown(urlId) {
-    const [devices, browsers, oses, referrers] = await Promise.all([
-      db
-        .select({
-          name: sql`coalesce(${clicks.device}, 'Desktop')`,
-          count: sql`count(*)`,
-        })
-        .from(clicks)
-        .where(eq(clicks.urlId, urlId))
-        .groupBy(sql`coalesce(${clicks.device}, 'Desktop')`)
-        .orderBy(desc(sql`count(*)`))
-        .limit(6),
-
-      db
-        .select({
-          name: sql`coalesce(${clicks.browser}, 'Other')`,
-          count: sql`count(*)`,
-        })
-        .from(clicks)
-        .where(eq(clicks.urlId, urlId))
-        .groupBy(sql`coalesce(${clicks.browser}, 'Other')`)
-        .orderBy(desc(sql`count(*)`))
-        .limit(6),
-
-      db
-        .select({
-          name: sql`coalesce(${clicks.os}, 'Other')`,
-          count: sql`count(*)`,
-        })
-        .from(clicks)
-        .where(eq(clicks.urlId, urlId))
-        .groupBy(sql`coalesce(${clicks.os}, 'Other')`)
-        .orderBy(desc(sql`count(*)`))
-        .limit(6),
-
-      db
-        .select({
-          name: sql`coalesce(${clicks.referrer}, 'Direct / None')`,
-          count: sql`count(*)`,
-        })
-        .from(clicks)
-        .where(eq(clicks.urlId, urlId))
-        .groupBy(sql`coalesce(${clicks.referrer}, 'Direct / None')`)
-        .orderBy(desc(sql`count(*)`))
-        .limit(8),
-    ]);
-
-    const format = (items) =>
-      items.map((i) => ({ name: String(i.name), count: Number(i.count) }));
-
-    return {
-      devices: format(devices),
-      browsers: format(browsers),
-      os: format(oses),
-      referrers: format(referrers),
-    };
+  async linkClicksByDay(urlId, since) {
+    return db
+      .select({ date: clickDay, clicks: count() })
+      .from(clicks)
+      .where(and(eq(clicks.urlId, urlId), gte(clicks.clickedAt, since)))
+      .groupBy(clickDay)
+      .orderBy(clickDay);
   },
 
-  /**
-   * Overview dashboard metrics for an authenticated user across all their links
-   */
-  async getUserDashboardOverview(userId) {
-    const [summaryRow] = await db
+  // Clicks split by device, browser, operating system, referrer and country.
+  // GROUPING SETS produces all five groupings from ONE scan of the link's
+  // clicks, instead of running five separate queries.
+  // Each result row is one value of one dimension, e.g. ("browsers", "Chrome", 42).
+  async linkBreakdowns(urlId, since) {
+    const { rows } = await db.execute(sql`
+      select
+        case
+          when grouping(device) = 0 then 'devices'
+          when grouping(browser) = 0 then 'browsers'
+          when grouping(os) = 0 then 'operatingSystems'
+          when grouping(referrer) = 0 then 'referrers'
+          else 'countries'
+        end as dimension,
+        coalesce(device, browser, os, referrer, country) as name,
+        count(*)::int as clicks
+      from clicks
+      where url_id = ${urlId} and clicked_at >= ${since.toISOString()}
+      group by grouping sets ((device), (browser), (os), (referrer), (country))
+      order by clicks desc
+    `);
+    return rows;
+  },
+
+  // Totals across all of a user's links. Reads click_count from the urls
+  // table, so it never has to scan the (much larger) clicks table.
+  async userTotals(userId) {
+    const [row] = await db
       .select({
-        totalLinks: sql`count(*)`,
-        totalClicks: sql`coalesce(sum(${urls.clickCount}), 0)`,
+        links: count(),
+        activeLinks: sql`count(*) filter (where ${urls.isActive})`.mapWith(Number),
+        clicks: sum(urls.clickCount).mapWith(Number),
       })
       .from(urls)
       .where(eq(urls.userId, userId));
+    return { links: row.links, activeLinks: row.activeLinks, clicks: row.clicks ?? 0 };
+  },
 
-    const topLinks = await db
+  async userClicksByDay(userId, since) {
+    return db
+      .select({ date: clickDay, clicks: count() })
+      .from(clicks)
+      .innerJoin(urls, eq(urls.id, clicks.urlId))
+      .where(and(eq(urls.userId, userId), gte(clicks.clickedAt, since)))
+      .groupBy(clickDay)
+      .orderBy(clickDay);
+  },
+
+  async userTopLinks(userId, limit) {
+    return db
       .select({
         id: urls.id,
         shortCode: urls.shortCode,
-        customAlias: urls.customAlias,
         originalUrl: urls.originalUrl,
         clickCount: urls.clickCount,
-        isActive: urls.isActive,
-        createdAt: urls.createdAt,
       })
       .from(urls)
       .where(eq(urls.userId, userId))
       .orderBy(desc(urls.clickCount))
-      .limit(5);
-
-    return {
-      totalLinks: Number(summaryRow?.totalLinks || 0),
-      totalClicks: Number(summaryRow?.totalClicks || 0),
-      topLinks,
-    };
+      .limit(limit);
   },
 };

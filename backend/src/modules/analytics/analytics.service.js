@@ -1,110 +1,79 @@
-import crypto from "node:crypto";
-import { UAParser } from "ua-parser-js";
+import { env } from "../../config/env.js";
+import { urlService } from "../urls/url.service.js";
 import { analyticsRepository } from "./analytics.repository.js";
-import { urlRepository } from "../urls/url.repository.js";
-import { NotFoundError, ForbiddenError } from "../../lib/errors.js";
-import { logger } from "../../lib/logger.js";
 
-const IP_SALT = "linkforge-ip-anonymization-salt-2026";
+const DAY_MS = 24 * 60 * 60 * 1000;
+const BREAKDOWN_ROWS = 6; // show the top 6 of each breakdown
 
-function anonymizeIp(ip) {
-  if (!ip) return null;
-  return crypto
-    .createHash("sha256")
-    .update(ip + IP_SALT)
-    .digest("hex")
-    .slice(0, 16);
+// Midnight UTC, `days - 1` days ago: the range covers `days` whole calendar days including today.
+function startOfRange(days) {
+  const todayUtc = new Date(new Date().toISOString().slice(0, 10));
+  return new Date(todayUtc.getTime() - (days - 1) * DAY_MS);
 }
 
-function parseReferrer(rawReferrer) {
-  if (!rawReferrer) return "Direct";
-  try {
-    const url = new URL(rawReferrer);
-    return url.hostname.replace(/^www\./, "");
-  } catch {
-    return rawReferrer.slice(0, 100);
+// The database only returns days that had clicks. Charts need every day,
+// so the gaps are filled with zeros here.
+function fillMissingDays(rows, since, days) {
+  const clicksByDate = new Map(rows.map((row) => [row.date, row.clicks]));
+  return Array.from({ length: days }, (_, index) => {
+    const date = new Date(since.getTime() + index * DAY_MS).toISOString().slice(0, 10);
+    return { date, clicks: clicksByDate.get(date) ?? 0 };
+  });
+}
+
+// Turns the flat (dimension, name, clicks) rows into { devices: [...], browsers: [...], ... }.
+function groupBreakdowns(rows) {
+  const breakdowns = { devices: [], browsers: [], operatingSystems: [], referrers: [], countries: [] };
+  for (const { dimension, name, clicks } of rows) {
+    const list = breakdowns[dimension];
+    if (list.length >= BREAKDOWN_ROWS) continue; // rows arrive sorted, most clicks first
+
+    // A missing referrer means the visitor typed or pasted the link.
+    const fallback = dimension === "referrers" ? "Direct" : "Unknown";
+    list.push({ name: name ?? fallback, clicks });
   }
+  return breakdowns;
 }
 
 export const analyticsService = {
-  /**
-   * Asynchronously record a click without blocking the redirect response
-   */
-  recordClickAsync(urlId, req) {
-    // Fire and forget using setImmediate
-    setImmediate(async () => {
-      try {
-        const rawIp =
-          req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
-          req.ip ||
-          req.connection?.remoteAddress ||
-          "";
-        const ipHash = anonymizeIp(rawIp);
+  // Everything the dashboard's overview needs, in one response.
+  async getOverview(userId, days) {
+    const since = startOfRange(days);
 
-        const userAgentString = req.headers["user-agent"] || "";
-        const parser = new UAParser(userAgentString);
-        const parsedUa = parser.getResult();
+    // Three independent queries: run them at the same time, not one after another.
+    const [totals, clicksByDay, topLinks] = await Promise.all([
+      analyticsRepository.userTotals(userId),
+      analyticsRepository.userClicksByDay(userId, since),
+      analyticsRepository.userTopLinks(userId, 5),
+    ]);
 
-        const browser = parsedUa.browser.name || "Unknown";
-        const os = parsedUa.os.name || "Unknown";
-        const deviceType = parsedUa.device.type;
-        const device =
-          deviceType === "mobile"
-            ? "Mobile"
-            : deviceType === "tablet"
-            ? "Tablet"
-            : "Desktop";
-
-        const rawReferrer = req.headers["referer"] || req.headers["referrer"];
-        const referrer = parseReferrer(rawReferrer);
-
-        await analyticsRepository.recordClick({
-          urlId,
-          ipHash,
-          userAgent: userAgentString.slice(0, 500),
-          browser,
-          os,
-          device,
-          referrer,
-          country: req.headers["cf-ipcountry"] || null, // Cloudflare / ALB geolocation header
-        });
-      } catch (err) {
-        logger.error({ urlId, err: err.message }, "Background analytics logging failed");
-      }
-    });
+    const timeseries = fillMissingDays(clicksByDay, since, days);
+    return {
+      days,
+      totals: { ...totals, clicksInRange: timeseries.reduce((total, day) => total + day.clicks, 0) },
+      timeseries,
+      topLinks: topLinks.map((link) => ({ ...link, shortUrl: `${env.BASE_URL}/${link.shortCode}` })),
+    };
   },
 
-  /**
-   * Ensure user owns the URL before returning analytics
-   */
-  async verifyOwnership(urlId, userId) {
-    const url = await urlRepository.findById(urlId);
-    if (!url) {
-      throw new NotFoundError("URL not found");
-    }
-    if (userId && url.userId && url.userId !== userId) {
-      throw new ForbiddenError("You do not have permission to view analytics for this URL");
-    }
-    return url;
-  },
+  // Everything the page for a single link needs, in one response.
+  async getLinkAnalytics(linkId, userId, days) {
+    // Throws "not found" unless the link belongs to this user.
+    const link = await urlService.getLink(linkId, userId);
+    const since = startOfRange(days);
 
-  async getSummary(urlId, userId) {
-    const url = await this.verifyOwnership(urlId, userId);
-    const summary = await analyticsRepository.getSummary(urlId);
-    return { url, summary };
-  },
+    const [totals, clicksByDay, breakdownRows] = await Promise.all([
+      analyticsRepository.linkTotals(linkId, since),
+      analyticsRepository.linkClicksByDay(linkId, since),
+      analyticsRepository.linkBreakdowns(linkId, since),
+    ]);
 
-  async getTimeSeries(urlId, userId, days = 14) {
-    await this.verifyOwnership(urlId, userId);
-    return await analyticsRepository.getTimeSeries(urlId, days);
-  },
-
-  async getBreakdown(urlId, userId) {
-    await this.verifyOwnership(urlId, userId);
-    return await analyticsRepository.getBreakdown(urlId);
-  },
-
-  async getUserDashboardOverview(userId) {
-    return await analyticsRepository.getUserDashboardOverview(userId);
+    return {
+      link,
+      days,
+      totals: { clicks: link.clickCount, ...totals },
+      timeseries: fillMissingDays(clicksByDay, since, days),
+      breakdowns: groupBreakdowns(breakdownRows),
+    };
   },
 };
