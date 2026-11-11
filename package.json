@@ -1,0 +1,17 @@
+{
+  "name": "linkforge",
+  "version": "1.0.0",
+  "description": "URL shortener with click analytics",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "docker": "node scripts/docker.mjs",
+    "docker:stop": "docker compose down",
+    "docker:reset": "node scripts/docker.mjs --reset"
+  }
+}
