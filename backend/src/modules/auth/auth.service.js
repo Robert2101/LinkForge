@@ -2,188 +2,125 @@ import crypto from "node:crypto";
 import argon2 from "argon2";
 import jwt from "jsonwebtoken";
 import { env } from "../../config/env.js";
-import { authRepository } from "./auth.repository.js";
-import {
-  ConflictError,
-  UnauthorizedError,
-  NotFoundError,
-} from "../../lib/errors.js";
+import { conflict, notFound, unauthorized } from "../../lib/errors.js";
 import { logger } from "../../lib/logger.js";
+import { authRepository } from "./auth.repository.js";
 
-// Helper to hash refresh tokens with SHA-256 before DB persistence
-function hashToken(token) {
-  return crypto.createHash("sha256").update(token).digest("hex");
+// How sign-in works
+// -----------------
+// A session is two tokens:
+//
+//   ACCESS TOKEN   A signed JWT that lives for 15 minutes. The browser keeps it
+//                  in memory and sends it with every API call. The server
+//                  verifies the signature and needs no database lookup.
+//
+//   REFRESH TOKEN  A long random string that lives for 7 days in an httpOnly
+//                  cookie, which JavaScript cannot read. Its only use is to
+//                  obtain a new access token. The database stores a hash of
+//                  it, never the token itself.
+//
+// Every refresh token works exactly once: using it returns a replacement
+// ("rotation"). If a used token ever shows up again, either the user or a
+// thief is holding a stolen copy, so every token from that login is revoked.
+
+// Argon2id with the parameters OWASP recommends (19 MiB memory, 2 passes).
+const ARGON2_OPTIONS = { type: argon2.argon2id, memoryCost: 19_456, timeCost: 2, parallelism: 1 };
+
+// A token replayed within this window is treated as a duplicate request
+// (double click, network retry), not as theft.
+const REPLAY_GRACE_MS = 10_000;
+
+const REFRESH_TOKEN_TTL_MS = env.REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
+
+const hashToken = (token) => crypto.createHash("sha256").update(token).digest("hex");
+
+function signAccessToken(userId) {
+  return jwt.sign({ sub: userId }, env.JWT_ACCESS_SECRET, {
+    algorithm: "HS256",
+    expiresIn: `${env.ACCESS_TOKEN_TTL_MINUTES}m`,
+  });
+}
+
+// Issues both tokens. A fresh login starts a new token family; a refresh
+// passes its existing family along.
+async function startSession(user, familyId = crypto.randomUUID()) {
+  const refreshToken = crypto.randomBytes(32).toString("base64url");
+
+  await authRepository.saveRefreshToken({
+    userId: user.id,
+    tokenHash: hashToken(refreshToken),
+    familyId,
+    expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
+  });
+
+  return { user, accessToken: signAccessToken(user.id), refreshToken };
+}
+
+// Verifying a password takes ~50ms on purpose. If we skipped that work for
+// unknown emails, response time would reveal which emails have accounts.
+// So unknown emails are checked against this throwaway hash instead.
+let fakePasswordHash;
+async function verifyPassword(user, password) {
+  fakePasswordHash ??= argon2.hash("not-a-real-password", ARGON2_OPTIONS);
+  const hash = user?.passwordHash ?? (await fakePasswordHash);
+  const matches = await argon2.verify(hash, password);
+  return Boolean(user) && matches;
 }
 
 export const authService = {
-  /**
-   * Register a new user with Argon2id password hashing
-   */
+  refreshTokenTtlMs: REFRESH_TOKEN_TTL_MS,
+
   async register({ email, password, name }) {
-    const existing = await authRepository.findUserByEmail(email);
-    if (existing) {
-      throw new ConflictError("A user with this email address already exists");
-    }
-
-    // Hash password with Argon2id using OWASP recommendations
-    const passwordHash = await argon2.hash(password, {
-      type: argon2.argon2id,
-      memoryCost: 19456, // 19 MiB
-      timeCost: 2,
-      parallelism: 1,
-    });
-
-    const user = await authRepository.createUser({
-      email,
-      passwordHash,
-      name: name || null,
-    });
-
-    // Generate initial token pair and token family
-    const familyId = crypto.randomUUID();
-    const { accessToken, refreshToken, expiresAt } = await this.issueTokenPair(
-      user.id,
-      familyId
-    );
-
-    return { user, accessToken, refreshToken, expiresAt };
+    const passwordHash = await argon2.hash(password, ARGON2_OPTIONS);
+    const user = await authRepository.createUser({ email, passwordHash, name: name ?? null });
+    if (!user) throw conflict("An account with this email already exists. Sign in instead.");
+    return startSession(user);
   },
 
-  /**
-   * Authenticate user with email and password
-   */
   async login({ email, password }) {
-    const user = await authRepository.findUserByEmail(email);
-    if (!user) {
-      throw new UnauthorizedError("Invalid email or password");
+    const account = await authRepository.findUserWithPasswordByEmail(email);
+    if (!(await verifyPassword(account, password))) {
+      // Same message for "no such email" and "wrong password".
+      throw unauthorized("Email or password is incorrect");
     }
 
-    const isValid = await argon2.verify(user.passwordHash, password);
-    if (!isValid) {
-      throw new UnauthorizedError("Invalid email or password");
-    }
+    await authRepository.deleteExpiredTokens(account.id);
 
-    // New login spawns a fresh token family
-    const familyId = crypto.randomUUID();
-    const { accessToken, refreshToken, expiresAt } = await this.issueTokenPair(
-      user.id,
-      familyId
-    );
-
-    const safeUser = {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      role: user.role,
-      createdAt: user.createdAt,
-    };
-
-    return { user: safeUser, accessToken, refreshToken, expiresAt };
+    const { id, name, createdAt } = account;
+    return startSession({ id, email: account.email, name, createdAt });
   },
 
-  /**
-   * Refresh Token Rotation with Token Family Reuse Detection
-   */
-  async refresh(rawRefreshToken) {
-    if (!rawRefreshToken) {
-      throw new UnauthorizedError("Refresh token is required");
-    }
-
-    // Verify JWT cryptographic signature
-    let decoded;
-    try {
-      decoded = jwt.verify(rawRefreshToken, env.JWT_REFRESH_SECRET);
-    } catch (err) {
-      throw new UnauthorizedError("Invalid or expired refresh token");
-    }
-
-    const tokenHash = hashToken(rawRefreshToken);
-    const tokenRecord = await authRepository.findRefreshTokenByHash(tokenHash);
-
-    // If record not found, reject
-    if (!tokenRecord) {
-      throw new UnauthorizedError("Invalid refresh session");
-    }
-
-    // BREACH DETECTION: If token was already revoked, someone is trying to reuse a spent token!
-    if (tokenRecord.isRevoked) {
-      logger.warn(
-        { userId: tokenRecord.userId, familyId: tokenRecord.familyId },
-        "🚨 Refresh token reuse detected! Revoking token family."
-      );
-      // Immediately revoke all tokens in the entire family
-      await authRepository.revokeAllTokensInFamily(tokenRecord.familyId);
-      throw new UnauthorizedError(
-        "Security violation: Token reuse detected. Please log in again."
-      );
-    }
-
-    // Check expiration
-    if (new Date() > new Date(tokenRecord.expiresAt)) {
-      await authRepository.revokeRefreshToken(tokenRecord.id);
-      throw new UnauthorizedError("Refresh session expired");
-    }
-
-    // Invalidate the current token
-    await authRepository.revokeRefreshToken(tokenRecord.id);
-
-    // Issue new pair maintaining the SAME family ID
-    const { accessToken, refreshToken: newRefreshToken, expiresAt } =
-      await this.issueTokenPair(tokenRecord.userId, tokenRecord.familyId);
-
-    return { accessToken, refreshToken: newRefreshToken, expiresAt };
-  },
-
-  /**
-   * Logout: Revoke the active refresh token
-   */
-  async logout(rawRefreshToken) {
-    if (rawRefreshToken) {
-      const tokenHash = hashToken(rawRefreshToken);
-      const tokenRecord = await authRepository.findRefreshTokenByHash(tokenHash);
-      if (tokenRecord) {
-        await authRepository.revokeRefreshToken(tokenRecord.id);
-      }
-    }
-  },
-
-  /**
-   * Get user profile by ID
-   */
-  async getMe(userId) {
-    const user = await authRepository.findUserById(userId);
-    if (!user) {
-      throw new NotFoundError("User not found");
-    }
-    return user;
-  },
-
-  /**
-   * Helper to issue access & refresh tokens
-   */
-  async issueTokenPair(userId, familyId) {
-    const accessToken = jwt.sign(
-      { sub: userId },
-      env.JWT_ACCESS_SECRET,
-      { expiresIn: env.JWT_ACCESS_EXPIRES_IN }
-    );
-
-    const refreshToken = jwt.sign(
-      { sub: userId, familyId, jti: crypto.randomUUID() },
-      env.JWT_REFRESH_SECRET,
-      { expiresIn: env.JWT_REFRESH_EXPIRES_IN }
-    );
-
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+  async refresh(refreshToken) {
+    if (!refreshToken) throw unauthorized();
     const tokenHash = hashToken(refreshToken);
 
-    await authRepository.createRefreshToken({
-      userId,
-      tokenHash,
-      familyId,
-      expiresAt,
-    });
+    const used = await authRepository.useRefreshToken(tokenHash);
+    if (used) {
+      const user = await authRepository.findUserById(used.userId);
+      if (!user) throw unauthorized();
+      return startSession(user, used.familyId);
+    }
 
-    return { accessToken, refreshToken, expiresAt };
+    // The token was not usable. Work out whether that is suspicious.
+    const existing = await authRepository.findRefreshToken(tokenHash);
+    const wasUsedEarlier =
+      existing?.revokedAt && Date.now() - existing.revokedAt.getTime() > REPLAY_GRACE_MS;
+
+    if (wasUsedEarlier) {
+      logger.warn({ userId: existing.userId }, "Refresh token reuse detected, revoking the session family");
+      await authRepository.revokeTokenFamily(existing.familyId);
+    }
+    throw unauthorized("Session expired. Sign in again.");
+  },
+
+  async logout(refreshToken) {
+    if (!refreshToken) return;
+    await authRepository.useRefreshToken(hashToken(refreshToken));
+  },
+
+  async getUser(userId) {
+    const user = await authRepository.findUserById(userId);
+    if (!user) throw notFound("Account not found");
+    return user;
   },
 };
