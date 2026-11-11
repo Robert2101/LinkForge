@@ -1,218 +1,132 @@
 import QRCode from "qrcode";
-import { generateShortCode } from "./base62.js";
-import { urlRepository } from "./url.repository.js";
-import { redis } from "../../lib/redis.js";
 import { env } from "../../config/env.js";
-import {
-  ConflictError,
-  NotFoundError,
-  ForbiddenError,
-  AppError,
-} from "../../lib/errors.js";
-import { logger } from "../../lib/logger.js";
+import { AppError, conflict, notFound } from "../../lib/errors.js";
+import { cacheLink, forgetCachedLink, readCachedLink } from "./url.cache.js";
+import { generateShortCode, RESERVED_CODES } from "./shortCode.js";
+import { urlRepository } from "./url.repository.js";
 
-const CACHE_TTL_SECONDS = 86400; // 24 hours
+const MAX_CODE_ATTEMPTS = 5;
+
+// What the API returns for a link: the database row plus its full short URL.
+function toPublicLink(row) {
+  return { ...row, shortUrl: `${env.BASE_URL}/${row.shortCode}` };
+}
+
+// The few fields a redirect needs. This is what gets cached.
+function toCachedLink({ id, originalUrl, isActive, expiresAt }) {
+  return { id, originalUrl, isActive, expiresAt };
+}
+
+async function insertWithGeneratedCode(link) {
+  // With 3.5 trillion possible codes a collision is rare, but the database
+  // (not luck) guarantees uniqueness: on a clash, try again with a new code.
+  for (let attempt = 0; attempt < MAX_CODE_ATTEMPTS; attempt++) {
+    const shortCode = generateShortCode();
+    if (RESERVED_CODES.has(shortCode.toLowerCase())) continue;
+
+    const row = await urlRepository.insert({ ...link, shortCode, isCustom: false });
+    if (row) return row;
+  }
+  throw new AppError(503, "CODE_GENERATION_FAILED", "Could not create a short link right now. Try again.");
+}
+
+// Database lookups that are in progress right now, by short code.
+// If 500 requests for the same uncached link arrive together, the first one
+// queries Postgres and the other 499 wait for that same answer instead of
+// sending 499 identical queries (a "cache stampede").
+const lookupsInProgress = new Map();
+
+async function loadLinkFromDatabase(shortCode) {
+  const row = await urlRepository.findByShortCode(shortCode);
+  await cacheLink(shortCode, row);
+  return row;
+}
 
 export const urlService = {
-  /**
-   * Create a shortened URL (Guest or Authenticated)
-   */
-  async createUrl({ userId, originalUrl, customAlias, expiresAt }) {
-    let shortCode;
+  async createLink({ userId, originalUrl, customAlias, expiresAt }) {
+    const link = {
+      userId: userId ?? null,
+      originalUrl,
+      expiresAt: expiresAt ? new Date(expiresAt) : null,
+    };
 
+    let row;
     if (customAlias) {
-      // Check if alias is already taken
-      const existing = await urlRepository.findByShortCode(customAlias);
-      if (existing) {
-        throw new ConflictError("Custom alias is already in use");
-      }
-      shortCode = customAlias;
+      row = await urlRepository.insert({ ...link, shortCode: customAlias, isCustom: true });
+      if (!row) throw conflict(`"${customAlias}" is already taken. Choose another name.`);
     } else {
-      // Collision-resistant CSPRNG Base62 generation
-      let attempts = 0;
-      const maxAttempts = 5;
-
-      while (attempts < maxAttempts) {
-        const candidate = generateShortCode(7);
-        const existing = await urlRepository.findByShortCode(candidate);
-        if (!existing) {
-          shortCode = candidate;
-          break;
-        }
-        attempts++;
-        logger.warn({ candidate, attempts }, "Base62 collision encountered, retrying");
-      }
-
-      if (!shortCode) {
-        throw new AppError(
-          "Failed to generate unique short-code after multiple attempts. Please try again.",
-          500
-        );
-      }
+      row = await insertWithGeneratedCode(link);
     }
 
-    try {
-      const urlRecord = await urlRepository.create({
-        userId: userId || null,
-        originalUrl,
-        shortCode,
-        customAlias: customAlias || null,
-        expiresAt: expiresAt || null,
-      });
-
-      // Warm up Redis cache immediately
-      const cachePayload = JSON.stringify({
-        id: urlRecord.id,
-        originalUrl: urlRecord.originalUrl,
-        isActive: urlRecord.isActive,
-        expiresAt: urlRecord.expiresAt,
-      });
-
-      await redis.set(`cache:url:${urlRecord.shortCode}`, cachePayload, "EX", CACHE_TTL_SECONDS);
-      if (urlRecord.customAlias) {
-        await redis.set(`cache:url:${urlRecord.customAlias}`, cachePayload, "EX", CACHE_TTL_SECONDS);
-      }
-
-      return {
-        ...urlRecord,
-        shortUrl: `${env.BASE_URL}/${urlRecord.customAlias || urlRecord.shortCode}`,
-      };
-    } catch (err) {
-      if (err.code === "23505") {
-        throw new ConflictError("Custom alias or short code already exists in database");
-      }
-      throw err;
-    }
+    // Put the new link in the cache straight away. This also replaces any
+    // "does not exist" entry left by someone who tried the code earlier.
+    await cacheLink(row.shortCode, toCachedLink(row));
+    return toPublicLink(row);
   },
 
-  /**
-   * List URLs for the authenticated user
-   */
-  async listUserUrls(userId, { page = 1, limit = 20, search }) {
+  async listLinks(userId, { page, limit, search }) {
     const offset = (page - 1) * limit;
-    const [urlsList, total] = await Promise.all([
-      urlRepository.listByUserId(userId, { limit, offset, search }),
-      urlRepository.countByUserId(userId, search),
+    const [rows, total] = await Promise.all([
+      urlRepository.listByUser(userId, { limit, offset, search }),
+      urlRepository.countByUser(userId, search),
     ]);
-
-    const items = urlsList.map((item) => ({
-      ...item,
-      shortUrl: `${env.BASE_URL}/${item.customAlias || item.shortCode}`,
-    }));
-
     return {
-      items,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-      },
+      items: rows.map(toPublicLink),
+      pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
     };
   },
 
-  /**
-   * Get single URL by ID
-   */
-  async getUrlById(id, userId) {
-    const url = await urlRepository.findById(id);
-    if (!url) {
-      throw new NotFoundError("URL not found");
-    }
-
-    if (userId && url.userId && url.userId !== userId) {
-      throw new ForbiddenError("You do not have permission to view this URL");
-    }
-
-    return {
-      ...url,
-      shortUrl: `${env.BASE_URL}/${url.customAlias || url.shortCode}`,
-    };
+  // Every read and write below includes the owner's id in the query itself.
+  // A link that belongs to someone else is simply "not found", so one user
+  // can never learn about, change or delete another user's link.
+  async getLink(id, userId) {
+    const row = await urlRepository.findOwned(id, userId);
+    if (!row) throw notFound("Link not found");
+    return toPublicLink(row);
   },
 
-  /**
-   * Update URL destination, active state, or expiration
-   */
-  async updateUrl(id, userId, fields) {
-    const existing = await urlRepository.findById(id);
-    if (!existing) {
-      throw new NotFoundError("URL not found");
-    }
+  async updateLink(id, userId, changes) {
+    const fields = { ...changes };
+    if (fields.expiresAt) fields.expiresAt = new Date(fields.expiresAt);
 
-    if (existing.userId !== userId) {
-      throw new ForbiddenError("You do not have permission to update this URL");
-    }
+    const row = await urlRepository.update(id, userId, fields);
+    if (!row) throw notFound("Link not found");
 
-    const updated = await urlRepository.update(id, userId, fields);
-
-    // Invalidate Redis cache for both shortCode and customAlias
-    await redis.del(`cache:url:${existing.shortCode}`);
-    if (existing.customAlias) {
-      await redis.del(`cache:url:${existing.customAlias}`);
-    }
-
-    return {
-      ...updated,
-      shortUrl: `${env.BASE_URL}/${updated.customAlias || updated.shortCode}`,
-    };
+    await forgetCachedLink(row.shortCode);
+    return toPublicLink(row);
   },
 
-  /**
-   * Delete URL
-   */
-  async deleteUrl(id, userId) {
-    const existing = await urlRepository.findById(id);
-    if (!existing) {
-      throw new NotFoundError("URL not found");
-    }
-
-    if (existing.userId !== userId) {
-      throw new ForbiddenError("You do not have permission to delete this URL");
-    }
-
-    await urlRepository.delete(id, userId);
-
-    // Invalidate cache
-    await redis.del(`cache:url:${existing.shortCode}`);
-    if (existing.customAlias) {
-      await redis.del(`cache:url:${existing.customAlias}`);
-    }
+  async deleteLink(id, userId) {
+    const removed = await urlRepository.remove(id, userId);
+    if (!removed) throw notFound("Link not found");
+    await forgetCachedLink(removed.shortCode);
   },
 
-  /**
-   * Generate QR Code for a short URL
-   */
-  async generateQrCode(id, format = "png") {
-    const url = await urlRepository.findById(id);
-    if (!url) {
-      throw new NotFoundError("URL not found");
+  // Finds where a short code points. Used by every redirect.
+  // `cache` reports how the answer was found and is sent as the X-Cache header:
+  //   HIT   answered from Redis, Postgres was not contacted
+  //   MISS  read from Postgres, then stored in Redis for the next visitor
+  async resolveShortCode(shortCode) {
+    const cached = await readCachedLink(shortCode);
+    if (cached !== undefined) return { link: cached, cache: "HIT" };
+
+    let lookup = lookupsInProgress.get(shortCode);
+    if (!lookup) {
+      lookup = loadLinkFromDatabase(shortCode).finally(() => lookupsInProgress.delete(shortCode));
+      lookupsInProgress.set(shortCode, lookup);
     }
+    return { link: await lookup, cache: "MISS" };
+  },
 
-    const targetUrl = `${env.BASE_URL}/${url.customAlias || url.shortCode}`;
+  async renderQrCode(shortCode, format) {
+    const { link } = await this.resolveShortCode(shortCode);
+    if (!link) throw notFound("Link not found");
 
-    if (format === "svg") {
-      const svg = await QRCode.toString(targetUrl, {
-        type: "svg",
-        margin: 2,
-        width: 300,
-        color: {
-          dark: "#0f172a",
-          light: "#ffffff",
-        },
-      });
-      return { contentType: "image/svg+xml", data: svg };
-    }
+    const target = `${env.BASE_URL}/${shortCode}`;
+    const options = { margin: 2, width: 512, errorCorrectionLevel: "M" };
 
-    // Default: DataURL (Base64 PNG)
-    const dataUrl = await QRCode.toDataURL(targetUrl, {
-      margin: 2,
-      width: 300,
-      color: {
-        dark: "#0f172a",
-        light: "#ffffff",
-      },
-    });
-
-    return { contentType: "application/json", dataUrl, shortUrl: targetUrl };
+    return format === "png"
+      ? { contentType: "image/png", body: await QRCode.toBuffer(target, { ...options, type: "png" }) }
+      : { contentType: "image/svg+xml", body: await QRCode.toString(target, { ...options, type: "svg" }) };
   },
 };

@@ -1,119 +1,87 @@
-import { eq, and, desc, sql, ilike, or } from "drizzle-orm";
-import { db } from "../../lib/db.js";
+import { and, count, desc, eq, ilike, or } from "drizzle-orm";
+import { db } from "../../db/client.js";
 import { urls } from "../../db/schema.js";
 
+// All SQL for the urls table lives here.
+
+// A user's links, optionally narrowed by a search term.
+function ownedBy(userId, search) {
+  const isOwner = eq(urls.userId, userId);
+  if (!search) return isOwner;
+
+  // % and _ are wildcards in LIKE. Escape them so they are matched literally.
+  const term = `%${search.replace(/[\\%_]/g, "\\$&")}%`;
+  return and(isOwner, or(ilike(urls.shortCode, term), ilike(urls.originalUrl, term)));
+}
+
 export const urlRepository = {
-  async create({
-    userId,
-    originalUrl,
-    shortCode,
-    customAlias,
-    expiresAt,
-  }) {
-    const [record] = await db
+  // Returns the new row, or null when the short code is already taken.
+  // The UNIQUE index on short_code decides, so there is no gap between
+  // "check if free" and "insert" for another request to slip into.
+  async insert({ userId, originalUrl, shortCode, isCustom, expiresAt }) {
+    const [row] = await db
       .insert(urls)
-      .values({
-        userId,
-        originalUrl,
-        shortCode,
-        customAlias,
-        expiresAt: expiresAt ? new Date(expiresAt) : null,
-      })
+      .values({ userId, originalUrl, shortCode, isCustom, expiresAt })
+      .onConflictDoNothing({ target: urls.shortCode })
       .returning();
-    return record;
+    return row ?? null;
   },
 
+  // The redirect lookup. One exact-match read on the unique short_code index,
+  // fetching only the columns a redirect needs.
   async findByShortCode(shortCode) {
-    const [record] = await db
-      .select()
+    const [row] = await db
+      .select({
+        id: urls.id,
+        originalUrl: urls.originalUrl,
+        isActive: urls.isActive,
+        expiresAt: urls.expiresAt,
+      })
       .from(urls)
-      .where(or(eq(urls.shortCode, shortCode), eq(urls.customAlias, shortCode)))
+      .where(eq(urls.shortCode, shortCode))
       .limit(1);
-    return record || null;
+    return row ?? null;
   },
 
-  async findById(id) {
-    const [record] = await db
+  async findOwned(id, userId) {
+    const [row] = await db
       .select()
       .from(urls)
-      .where(eq(urls.id, id))
+      .where(and(eq(urls.id, id), eq(urls.userId, userId)))
       .limit(1);
-    return record || null;
+    return row ?? null;
   },
 
-  async listByUserId(userId, { limit = 20, offset = 0, search }) {
-    let condition = eq(urls.userId, userId);
-
-    if (search) {
-      condition = and(
-        condition,
-        or(
-          ilike(urls.originalUrl, `%${search}%`),
-          ilike(urls.shortCode, `%${search}%`),
-          ilike(urls.customAlias, `%${search}%`)
-        )
-      );
-    }
-
-    return await db
+  // Served by the (user_id, created_at DESC) index: rows come out already sorted.
+  async listByUser(userId, { limit, offset, search }) {
+    return db
       .select()
       .from(urls)
-      .where(condition)
+      .where(ownedBy(userId, search))
       .orderBy(desc(urls.createdAt))
       .limit(limit)
       .offset(offset);
   },
 
-  async countByUserId(userId, search) {
-    let condition = eq(urls.userId, userId);
-
-    if (search) {
-      condition = and(
-        condition,
-        or(
-          ilike(urls.originalUrl, `%${search}%`),
-          ilike(urls.shortCode, `%${search}%`),
-          ilike(urls.customAlias, `%${search}%`)
-        )
-      );
-    }
-
-    const [result] = await db
-      .select({ count: sql`count(*)` })
-      .from(urls)
-      .where(condition);
-    return Number(result?.count || 0);
+  async countByUser(userId, search) {
+    const [row] = await db.select({ total: count() }).from(urls).where(ownedBy(userId, search));
+    return row.total;
   },
 
   async update(id, userId, fields) {
-    const updateValues = { ...fields, updatedAt: new Date() };
-    if (updateValues.expiresAt) {
-      updateValues.expiresAt = new Date(updateValues.expiresAt);
-    }
-
-    const [updated] = await db
+    const [row] = await db
       .update(urls)
-      .set(updateValues)
+      .set({ ...fields, updatedAt: new Date() })
       .where(and(eq(urls.id, id), eq(urls.userId, userId)))
       .returning();
-    return updated || null;
+    return row ?? null;
   },
 
-  async delete(id, userId) {
-    const [deleted] = await db
+  async remove(id, userId) {
+    const [row] = await db
       .delete(urls)
       .where(and(eq(urls.id, id), eq(urls.userId, userId)))
-      .returning();
-    return deleted || null;
-  },
-
-  async incrementClickCount(id) {
-    await db
-      .update(urls)
-      .set({
-        clickCount: sql`${urls.clickCount} + 1`,
-        updatedAt: new Date(),
-      })
-      .where(eq(urls.id, id));
+      .returning({ shortCode: urls.shortCode });
+    return row ?? null;
   },
 };
