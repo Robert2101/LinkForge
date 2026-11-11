@@ -1,0 +1,39 @@
+# Throwaway Postgres and Redis for the backend test suite.
+# Data lives in memory only and disappears when the containers stop.
+#
+#   docker compose -f docker-compose.test.yml up -d
+#   cd backend && cp .env.test.example .env.test
+#   npm run test:migrate && npm test
+#   docker compose -f docker-compose.test.yml down
+#
+# Different ports from the main stack (5433 / 6380), so both can run at once.
+
+name: linkforge-test
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: linkforge
+      POSTGRES_PASSWORD: linkforge
+      POSTGRES_DB: linkforge_test
+    tmpfs:
+      - /var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U linkforge -d linkforge_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

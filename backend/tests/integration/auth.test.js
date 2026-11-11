@@ -1,87 +1,165 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import request from "supertest";
-import app from "../../src/app.js";
+import { pool } from "../../src/db/client.js";
+import { newClient, signUp, uniqueEmail, useApp } from "../helpers.js";
 
-const testUser = {
-  email: `test_${Date.now()}@example.com`,
-  password: "Password123!",
-  name: "LinkForge Tester",
-};
+useApp();
 
-let accessToken = "";
-let refreshTokenCookie = "";
+const refreshCookieOf = (res) =>
+  (res.headers["set-cookie"] ?? []).find((cookie) => cookie.startsWith("refresh_token="));
 
-test("Auth Integration — registers a new user with Argon2id", async () => {
-  const res = await request(app)
-    .post("/api/v1/auth/register")
-    .send(testUser);
+test("register creates an account and starts a session", async () => {
+  const client = newClient();
+  const email = uniqueEmail();
+  const res = await client.post("/api/v1/auth/register").send({ email, password: "Correct-Horse-1" });
 
   assert.equal(res.status, 201);
-  assert.ok(res.body.user);
-  assert.equal(res.body.user.email, testUser.email);
+  assert.equal(res.body.user.email, email);
   assert.ok(res.body.accessToken);
-  assert.equal(res.body.user.passwordHash, undefined); // password hash must NOT be leaked
+  assert.equal(res.body.user.passwordHash, undefined, "the password hash must never leave the server");
+  assert.equal(res.body.refreshToken, undefined, "the refresh token belongs in the cookie only");
+
+  const cookie = refreshCookieOf(res);
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /SameSite=Strict/);
+  assert.match(cookie, /Path=\/api\/v1\/auth/);
 });
 
-test("Auth Integration — duplicate registration returns HTTP 409 Conflict", async () => {
-  const res = await request(app)
+test("register validates its input", async () => {
+  const client = newClient();
+  const attempt = (body) => client.post("/api/v1/auth/register").send(body);
+
+  const weak = await attempt({ email: uniqueEmail(), password: "password" });
+  assert.equal(weak.status, 422);
+  assert.equal(weak.body.error.code, "VALIDATION_FAILED");
+  assert.ok(weak.body.error.details.some((issue) => issue.field === "password"));
+
+  assert.equal((await attempt({ email: "not-an-email", password: "Correct-Horse-1" })).status, 422);
+  assert.equal((await attempt({})).status, 422);
+});
+
+test("registering the same email twice is a conflict, whatever the letter case", async () => {
+  const { email } = await signUp();
+  const res = await newClient()
     .post("/api/v1/auth/register")
-    .send(testUser);
+    .send({ email: email.toUpperCase(), password: "Correct-Horse-1" });
 
   assert.equal(res.status, 409);
-  assert.equal(res.body.error.code, "ConflictError");
+  assert.equal(res.body.error.code, "CONFLICT");
 });
 
-test("Auth Integration — logs in user and returns tokens with HTTP-only cookie", async () => {
-  const res = await request(app)
-    .post("/api/v1/auth/login")
-    .send({
-      email: testUser.email,
-      password: testUser.password,
-    });
+test("login accepts the right password and rejects everything else with one message", async () => {
+  const { email, password } = await signUp();
+  const client = newClient();
 
+  const ok = await client.post("/api/v1/auth/login").send({ email, password });
+  assert.equal(ok.status, 200);
+  assert.ok(ok.body.accessToken);
+  assert.ok(refreshCookieOf(ok));
+
+  const wrongPassword = await client.post("/api/v1/auth/login").send({ email, password: "Wrong-Horse-1" });
+  const unknownEmail = await client.post("/api/v1/auth/login").send({ email: uniqueEmail(), password });
+  assert.equal(wrongPassword.status, 401);
+  assert.equal(unknownEmail.status, 401);
+  assert.equal(
+    wrongPassword.body.error.message,
+    unknownEmail.body.error.message,
+    "the response must not reveal whether the email exists"
+  );
+});
+
+test("protected routes need a valid access token", async () => {
+  const { client, auth, email } = await signUp();
+
+  const me = await client.get("/api/v1/auth/me").set(auth);
+  assert.equal(me.status, 200);
+  assert.equal(me.body.user.email, email);
+
+  assert.equal((await client.get("/api/v1/auth/me")).status, 401);
+  assert.equal((await client.get("/api/v1/auth/me").set("Authorization", "Bearer not-a-token")).status, 401);
+  assert.equal((await client.get("/api/v1/auth/me").set("Authorization", "Basic abc")).status, 401);
+});
+
+test("refresh returns a new access token and replaces the refresh token", async () => {
+  const { client, user } = await signUp(); // the client now holds the refresh cookie
+
+  const res = await client.post("/api/v1/auth/refresh");
   assert.equal(res.status, 200);
   assert.ok(res.body.accessToken);
-  accessToken = res.body.accessToken;
+  assert.equal(res.body.user.id, user.id);
+  assert.ok(refreshCookieOf(res), "a replacement refresh token must be issued");
 
-  // Verify Set-Cookie header contains refreshToken and HttpOnly
-  const cookies = res.headers["set-cookie"];
-  assert.ok(cookies, "Expected set-cookie header");
-  const refreshCookie = cookies.find((c) => c.startsWith("refreshToken="));
-  assert.ok(refreshCookie, "Expected refreshToken cookie");
-  assert.ok(refreshCookie.includes("HttpOnly"));
-  refreshTokenCookie = refreshCookie.split(";")[0];
+  // The rotated cookie works for the next refresh too.
+  assert.equal((await client.post("/api/v1/auth/refresh")).status, 200);
 });
 
-test("Auth Integration — accesses protected /api/v1/auth/me", async () => {
-  const res = await request(app)
-    .get("/api/v1/auth/me")
-    .set("Authorization", `Bearer ${accessToken}`);
-
-  assert.equal(res.status, 200);
-  assert.equal(res.body.user.email, testUser.email);
+test("refresh without a cookie is rejected", async () => {
+  assert.equal((await newClient().post("/api/v1/auth/refresh")).status, 401);
 });
 
-test("Auth Integration — refreshes token and rotates refresh token", async () => {
-  const res = await request(app)
-    .post("/api/v1/auth/refresh")
-    .set("Cookie", [refreshTokenCookie]);
+test("replaying a used refresh token revokes the whole session family", async () => {
+  // The legitimate browser signs up...
+  const browser = newClient();
+  const signUpRes = await browser
+    .post("/api/v1/auth/register")
+    .send({ email: uniqueEmail(), password: "Correct-Horse-1" });
+  const stolenCookie = refreshCookieOf(signUpRes).split(";")[0];
 
-  assert.equal(res.status, 200);
-  assert.ok(res.body.accessToken);
+  // ...and refreshes normally, which uses up the first token.
+  assert.equal((await browser.post("/api/v1/auth/refresh")).status, 200);
 
-  // New refresh token should be issued in set-cookie
-  const cookies = res.headers["set-cookie"];
-  assert.ok(cookies);
-  const newRefreshCookie = cookies.find((c) => c.startsWith("refreshToken="));
-  assert.ok(newRefreshCookie);
+  // Make that use look older than the duplicate-request grace period.
+  await pool.query(
+    `UPDATE refresh_tokens SET revoked_at = now() - interval '1 minute'
+     WHERE user_id = $1 AND revoked_at IS NOT NULL`,
+    [signUpRes.body.user.id]
+  );
 
-  // BREACH DETECTION TEST: Replaying the old (now revoked) refresh token must fail
-  const replayRes = await request(app)
-    .post("/api/v1/auth/refresh")
-    .set("Cookie", [refreshTokenCookie]);
+  // An attacker replays the first token.
+  const attacker = newClient();
+  const replay = await attacker.post("/api/v1/auth/refresh").set("Cookie", stolenCookie);
+  assert.equal(replay.status, 401);
 
-  assert.equal(replayRes.status, 401);
-  assert.ok(replayRes.body.error.message.includes("Token reuse detected"));
+  // The theft was detected, so the legitimate browser's newer token is dead too.
+  assert.equal((await browser.post("/api/v1/auth/refresh")).status, 401);
+});
+
+test("a duplicate refresh within the grace period does not end the session", async () => {
+  const browser = newClient();
+  const signUpRes = await browser
+    .post("/api/v1/auth/register")
+    .send({ email: uniqueEmail(), password: "Correct-Horse-1" });
+  const firstCookie = refreshCookieOf(signUpRes).split(";")[0];
+
+  assert.equal((await browser.post("/api/v1/auth/refresh")).status, 200);
+
+  // The same token arrives again immediately (double click, retry).
+  const duplicate = await newClient().post("/api/v1/auth/refresh").set("Cookie", firstCookie);
+  assert.equal(duplicate.status, 401);
+
+  // The session that won the race keeps working.
+  assert.equal((await browser.post("/api/v1/auth/refresh")).status, 200);
+});
+
+test("logout ends the session", async () => {
+  const { client } = await signUp();
+
+  const res = await client.post("/api/v1/auth/logout");
+  assert.equal(res.status, 204);
+  assert.equal((await client.post("/api/v1/auth/refresh")).status, 401);
+});
+
+test("only a hash of the refresh token is stored", async () => {
+  const client = newClient();
+  const res = await client
+    .post("/api/v1/auth/register")
+    .send({ email: uniqueEmail(), password: "Correct-Horse-1" });
+  const rawToken = refreshCookieOf(res).split(";")[0].split("=")[1];
+
+  const { rows } = await pool.query("SELECT token_hash FROM refresh_tokens WHERE user_id = $1", [
+    res.body.user.id,
+  ]);
+  assert.equal(rows.length, 1);
+  assert.notEqual(rows[0].token_hash, rawToken);
+  assert.match(rows[0].token_hash, /^[0-9a-f]{64}$/);
 });
